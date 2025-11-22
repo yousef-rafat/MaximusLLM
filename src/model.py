@@ -347,12 +347,12 @@ class Model(nn.Module):
 
 # TODO: move to a json file
 class Config(Gemma3TextConfig):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, rope_theta, context_length, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.q_lora_rank = 32 # may increase
         self.kv_lora_rank = 32
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.base = 10000
-        self.initial_context_length = 32768
+        self.base = rope_theta
+        self.initial_context_length = context_length
         self.ntk_alpha = 1.0
 

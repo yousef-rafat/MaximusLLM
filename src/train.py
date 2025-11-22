@@ -1,15 +1,21 @@
+import os
 import torch
 import random
-from model import Model
+from model import Model, Config
 from itertools import islice
 import torch.nn.functional as F
+import torch.distributed as dist
 from datasets import load_dataset
+import torch.multiprocessing as mp
 import torch.ao.quantization as quant
 from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset
 
 INDEX = 0
-MAX_LENGTH = 32_000
+LONG_CONTEXT_TRAINING = False
+MAX_LENGTH = 4096 if not LONG_CONTEXT_TRAINING else 32768
+ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
+SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
 
 class Settings:
@@ -54,7 +60,10 @@ class CUDAPreFetch:
         return batch
 
 class HFStreamDataset(IterableDataset):
-    def __init__(self, dataset: str = "HuggingFaceFW/fineweb", take = None):
+    def __init__(self, dataset: str = "HuggingFaceFW/fineweb", take = None, rank = 0, world_size = 1):
+
+        self.rank = rank
+        self.world_size = world_size
 
         dataset = load_dataset(dataset, name = "CC-MAIN-2024-10", split = "train", streaming = True)
         self.dataset = islice(dataset, INDEX, None)
@@ -68,7 +77,11 @@ class HFStreamDataset(IterableDataset):
         buffer = []
         batch = []
 
-        for item in self.dataset:
+        for i, item in enumerate(self.dataset):
+
+            if i % self.world_size != self.rank:
+                continue
+
             tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
 
             # random start if longer than MAX_LENGTH
@@ -136,16 +149,24 @@ def apply_weight_decay(model, weight_decay = 0.1):
         {"params": decay_params, "weight_decay": weight_decay}
     ]
             
-def main():
+def main(local_rank, world_size):
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = HFStreamDataset()
+    dist.init_process_group(backend='nccl', world_size = world_size, rank = local_rank)
+
+    device = torch.device(f"cuda:{local_rank}")
+
+    dataset = HFStreamDataset(world_size=world_size, rank = local_rank)
+    config = Config(rope_theta=ROPE_THETA, context_length=MAX_LENGTH)
     
-    model = Model()
+    model = Model(config)
     prefetch = CUDAPreFetch(dataset, device)
 
     optimizer = torch.optim.AdamW(apply_weight_decay(model, Settings.weight_decay), lr = Settings.lr_rate)
     scaler = torch.cuda.amp.GradScaler(enabled = True)
+
+    if os.path.exists("model.pt"):
+        checkpoint = torch.load("model.pt")
+        model.load_state_dict(checkpoint)
 
     # quantization
     if QAT_TRAINING:
@@ -161,6 +182,8 @@ def main():
     step = 0
     batch = prefetch.next()
 
+    model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank])
+
     while batch is not None:
         inputs = batch
         next_batch = prefetch.next()
@@ -174,9 +197,20 @@ def main():
         scaler.step(optimizer)
         scaler.update()
 
-        if step % 50 == 0:
+        if local_rank == 0 and step % 50 == 0:
             print(f"step {step:05d} | loss {loss.item():.4f}")
 
         batch = next_batch
+        step += 1
 
-    torch.save(model, "model.pt")
+        if step % SAVE_EVERY_STEP == 0 and local_rank == 0:
+            torch.save(model.state_dict(), f"model_{step}.pt")
+
+    dist.destroy_process_group()
+    
+    if local_rank == 0:
+        torch.save(model.state_dict(), "model.pt")
+
+if __name__ == "__main__":
+    world_size = torch.cuda.device_count()
+    mp.spawn(main, args=(world_size,), nprocs=world_size, join=True)
