@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 import torch.ao.quantization as quant
 from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset
+from torch.nn.utils.rnn import pad_sequence
 
 INDEX = 0
 TORCH_COMPILE = True
@@ -77,6 +78,13 @@ class HFStreamDataset(IterableDataset):
     def __iter__(self, batch_size = Settings.batch_size):
         buffer = []
         batch = []
+        attention_masks = []
+
+        def return_batch(batch, attention_masks = None):
+            if LONG_CONTEXT_TRAINING:
+                yield torch.tensor(batch, dtype=torch.long), torch.ones_like(batch)
+            else:
+                yield pad_sequence(batch, batch_first = True), pad_sequence(attention_masks, batch_first = True, padding_value = 0)
 
         for i, item in enumerate(self.dataset):
 
@@ -85,28 +93,34 @@ class HFStreamDataset(IterableDataset):
 
             tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
 
-            # random start if longer than MAX_LENGTH
-            if len(tokens) > MAX_LENGTH:
-                start = random.randint(0, len(tokens) - (MAX_LENGTH - 1))
-                tokens = tokens[start:start + (MAX_LENGTH - 1)]
-                seq = tokens + [self.eos_token]
-                batch.append(seq)
-            else:
-                # accumulate tokens in a buffer
-                buffer.extend(tokens)
-
-                if buffer:
-                    buffer.append(self.eos_token)
-
-                while len(buffer) >= MAX_LENGTH:
-                    seq = buffer[:MAX_LENGTH]
-                    buffer = buffer[MAX_LENGTH:]
+            # TODO: should mix long, short, and medium sequence lengths
+            if LONG_CONTEXT_TRAINING:
+                # random start if longer than MAX_LENGTH
+                if len(tokens) > MAX_LENGTH:
+                    start = random.randint(0, len(tokens) - (MAX_LENGTH - 1))
+                    tokens = tokens[start:start + (MAX_LENGTH - 1)]
+                    seq = tokens + [self.eos_token]
                     batch.append(seq)
+                else:
+                    # accumulate tokens in a buffer
+                    buffer.extend(tokens)
+
+                    if buffer:
+                        buffer.append(self.eos_token)
+
+                    while len(buffer) >= MAX_LENGTH:
+                        seq = buffer[:MAX_LENGTH]
+                        buffer = buffer[MAX_LENGTH:]
+                        batch.append(seq)
+            else:
+                batch.append(torch.tensor(tokens))
+                attention_masks.append(torch.ones(len(tokens)))
 
             # yield full batches
             if len(batch) == batch_size:
-                yield torch.tensor(batch, dtype=torch.long)
+                yield from return_batch(batch, attention_masks)
                 batch = []
+                attention_masks = []
 
         # remaining tokens
         if buffer:
@@ -114,7 +128,7 @@ class HFStreamDataset(IterableDataset):
 
         # last partial batch
         if batch:
-            yield torch.tensor(batch, dtype=torch.long)
+            yield from return_batch(batch, attention_masks)
 
 def compute_clm_loss(logits, labels):
     shift_logits = logits[..., :-1, :].contiguous()
@@ -188,7 +202,8 @@ def main(local_rank, world_size):
         model = model.to(device)
 
     step = 0
-    batch = prefetch.next()
+    # TODO: check if it skips the first batch
+    batch = prefetch.next().next()
 
     model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank])
 
@@ -197,7 +212,8 @@ def main(local_rank, world_size):
         next_batch = prefetch.next()
 
         with torch.amp.autocast(enabled = True, device_type = "cuda"):
-            logits = model(inputs)
+            input_ids, attention_mask = inputs
+            logits = model(input_ids, attention_mask = attention_mask)
             loss = compute_clm_loss(logits, inputs)
         
         optimizer.zero_grad(set_to_none = True)

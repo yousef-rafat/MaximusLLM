@@ -155,10 +155,11 @@ class Attention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        hidden_states,
+        attention_mask,
+        position_embeddings,
+        past_key_values = None,
+        cache_position = None,
         **kwargs,
     ):
         input_shape = hidden_states.shape[:-1]
@@ -188,7 +189,7 @@ class Attention(nn.Module):
         if value_states.ndim == 3:
             value_states = value_states.unsqueeze(2)
 
-        attn_output = nn.functional.scaled_dot_product_attention(query_states, key_states, value_states)
+        attn_output = nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = attention_mask)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -212,6 +213,7 @@ class DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attention_mask,
         position_embeddings: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -227,6 +229,7 @@ class DecoderLayer(nn.Module):
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
+            attention_mask = attention_mask,
             position_embeddings=position_embeddings,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -287,7 +290,8 @@ class Model(nn.Module):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids,
+        attention_mask,
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
@@ -332,6 +336,7 @@ class Model(nn.Module):
 
             layer_outputs = decoder_layer(
                 hidden_states,
+                attention_mask = attention_mask,
                 position_embeddings = positional_embeddings,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -347,12 +352,12 @@ class Model(nn.Module):
 
 # TODO: move to a json file
 class Config(Gemma3TextConfig):
-    def __init__(self, rope_theta, context_length, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.q_lora_rank = 32 # may increase
         self.kv_lora_rank = 32
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.base = rope_theta
-        self.initial_context_length = context_length
+        self.base = 10_000
+        self.initial_context_length = 4096
         self.ntk_alpha = 1.0
 
