@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset
 
 INDEX = 0
+TORCH_COMPILE = True
 LONG_CONTEXT_TRAINING = False
 MAX_LENGTH = 4096 if not LONG_CONTEXT_TRAINING else 32768
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
@@ -33,7 +34,7 @@ class CUDAPreFetch:
     def async_load(self):
 
         try:
-            batch = next(self.iter)
+            batch = next(iter(self.iter))
         except StopIteration:
             self.next_batch = None
             return
@@ -67,7 +68,7 @@ class HFStreamDataset(IterableDataset):
 
         dataset = load_dataset(dataset, name = "CC-MAIN-2024-10", split = "train", streaming = True)
         self.dataset = islice(dataset, INDEX, None)
-        self.tokenizer = AutoTokenizer.from_pretrained("")
+        self.tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m", token = "") # requires a token
         self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
 
         if take is not None:
@@ -131,7 +132,7 @@ def perplexity(loss):
 
 def apply_weight_decay(model, weight_decay = 0.1):
     no_decay_params, decay_params = [], []
-    for name, param in model.parameters():
+    for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
@@ -156,13 +157,16 @@ def main(local_rank, world_size):
     device = torch.device(f"cuda:{local_rank}")
 
     dataset = HFStreamDataset(world_size=world_size, rank = local_rank)
-    config = Config(rope_theta=ROPE_THETA, context_length=MAX_LENGTH)
+    config = Config.from_pretrained("google/gemma-3-270m", token = "")
+
+    config.rope_theta = ROPE_THETA
+    config.context_length = MAX_LENGTH
     
-    model = Model(config)
+    model = Model(config).to(torch.float16)
     prefetch = CUDAPreFetch(dataset, device)
 
     optimizer = torch.optim.AdamW(apply_weight_decay(model, Settings.weight_decay), lr = Settings.lr_rate)
-    scaler = torch.cuda.amp.GradScaler(enabled = True)
+    scaler = torch.amp.GradScaler(enabled = True)
 
     if os.path.exists("model.pt"):
         checkpoint = torch.load("model.pt")
@@ -177,7 +181,11 @@ def main(local_rank, world_size):
 
 
     model.train()
-    model = torch.compile(model).to(device)
+    if TORCH_COMPILE:
+        model = model.to(device)
+        model = torch.compile(model, fullgraph = True, mode = "default")
+    else:
+        model = model.to(device)
 
     step = 0
     batch = prefetch.next()
@@ -188,7 +196,7 @@ def main(local_rank, world_size):
         inputs = batch
         next_batch = prefetch.next()
 
-        with torch.cuda.amp.autocast(enabled = True):
+        with torch.amp.autocast(enabled = True, device_type = "cuda"):
             logits = model(inputs)
             loss = compute_clm_loss(logits, inputs)
         
@@ -212,5 +220,7 @@ def main(local_rank, world_size):
         torch.save(model.state_dict(), "model.pt")
 
 if __name__ == "__main__":
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
     world_size = torch.cuda.device_count()
     mp.spawn(main, args=(world_size,), nprocs=world_size, join=True)
