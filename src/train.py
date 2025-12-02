@@ -214,7 +214,7 @@ def main(local_rank, world_size):
         with torch.amp.autocast(enabled = True, device_type = "cuda"):
             input_ids, attention_mask = inputs
             logits = model(input_ids, attention_mask = attention_mask)
-            loss = compute_clm_loss(logits, inputs)
+            loss = compute_clm_loss(logits, input_ids)
         
         optimizer.zero_grad(set_to_none = True)
         scaler.scale(loss).backward()

@@ -40,9 +40,6 @@ class RMSNorm(nn.Module):
         return output.type_as(x)
 
 def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    cos = cos[None, :, None, :]
-    sin = sin[None, :, None, :]
-
     x1, x2 = torch.chunk(x, 2, dim=-1)
     return torch.cat([x1 * cos - x2 * sin,
                       x2 * cos + x1 * sin], dim=-1)
@@ -130,6 +127,21 @@ class Attention(nn.Module):
         # start with strong RoPE bias
         self.nope_logit = nn.Parameter(torch.tensor(-3.0))
 
+        rope_logit = 0.5 # start with equal local and global rope
+        logit = torch.log(torch.tensor(rope_logit) / (1.0 - torch.tensor(rope_logit)))
+        self.rope_global_local_logit = nn.Parameter(logit)
+
+    def compute_freq_gl(self, pos_embed):
+        cos_g, sin_g, cos_l, sin_l = pos_embed
+        alpha = torch.sigmoid(self.rope_global_local_logit)
+        alpha = alpha.view(1, 1, 1, 1)
+        rope_dim = self.head_dim // 2
+
+        cos = cos_g.view(1, -1, 1, rope_dim) * alpha + (1.0 - alpha) * cos_l.view(1, -1, 1, rope_dim)
+        sin = sin_g.view(1, -1, 1, rope_dim) * alpha + (1.0 - alpha) * sin_l.view(1, -1, 1, rope_dim)
+
+        return cos, sin
+
     def apply_latent_attention(self, hidden_states, freqs_cis):
 
         cos, sin = freqs_cis
@@ -164,6 +176,7 @@ class Attention(nn.Module):
     ):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        cos, sin = self.compute_freq_gl(position_embeddings)
 
         if not self.is_latent:
             query_states = self.q_proj(hidden_states).view(hidden_shape)
@@ -174,9 +187,7 @@ class Attention(nn.Module):
             key_states = self.k_norm(key_states)
 
         else:
-            query_states, key_states, value_states = self.apply_latent_attention(hidden_states, position_embeddings)
-
-        cos, sin = position_embeddings
+            query_states, key_states, value_states = self.apply_latent_attention(hidden_states, (cos, sin))
 
         if not self.is_latent:
             query_states = _apply_rotary_emb(query_states, cos, sin)
@@ -189,6 +200,7 @@ class Attention(nn.Module):
         if value_states.ndim == 3:
             value_states = value_states.unsqueeze(2)
 
+        attention_mask = attention_mask[:, :, None, None]
         attn_output = nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = attention_mask)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -262,9 +274,6 @@ class Model(nn.Module):
         self.head_dim = config.head_dim
         self.num_heads = config.num_attention_heads
 
-        rope_logit = 0.5 # start with equal local and global rope
-        logit = torch.log(torch.tensor(rope_logit) / (1.0 - torch.tensor(rope_logit)))
-        self.rope_global_local_logit = nn.Parameter(torch.full((config.num_attention_heads,), logit))
 
         self.embed_tokens = EmbeddingWithScale(
             config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5
@@ -315,22 +324,15 @@ class Model(nn.Module):
                 device=inputs_embeds.device,
             )
 
-        hidden_states = inputs_embeds.view(inputs_embeds.size(0), -1, self.num_heads, self.head_dim)
         seq_len = input_ids.size(1)
 
         # mix the global and local cos/sin 
         cos_g, sin_g = self.rotary_emb._compute_cos_sin(seq_len)
         cos_l, sin_l = self.rotary_emb_local._compute_cos_sin(seq_len)
-        cis_orig = cos_g.shape
 
-        alpha = torch.sigmoid(self.rope_global_local_logit)
-        alpha = alpha.view(1, 1, self.num_heads, 1)
+        positional_embeddings = (cos_g, sin_g, cos_l, sin_l)
 
-        cos = cos_g.view(1, -1, self.num_heads, self.head_dim) * alpha + (1.0 - alpha) * cos_l.view(1, -1, self.num_heads, self.head_dim)
-        sin = sin_g.view(1, -1, self.num_heads, self.head_dim) * alpha + (1.0 - alpha) * sin_l.view(1, -1, self.num_heads, self.head_dim)
-        positional_embeddings = (cos.view(*cis_orig), sin.view(*cis_orig))
-
-        hidden_states = hidden_states.view(*inputs_embeds.shape)
+        hidden_states = inputs_embeds
         num_layers = self.config.num_hidden_layers
         for i, decoder_layer in enumerate(self.layers[: num_layers]):
 
