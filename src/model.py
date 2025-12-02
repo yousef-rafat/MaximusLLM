@@ -287,6 +287,7 @@ class Model(nn.Module):
         config = copy.deepcopy(config)
         config.rope_theta = config.rope_local_base_freq
         self.rotary_emb_local = RotaryEmbedding(config=config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.post_init()
 
@@ -349,8 +350,9 @@ class Model(nn.Module):
             hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
 
-        return hidden_states
+        return logits
 
 # TODO: move to a json file
 class Config(Gemma3TextConfig):
