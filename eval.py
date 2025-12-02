@@ -1,23 +1,24 @@
 import time
 import torch
 
-def benchmark_forward(model, input_sample, device="cpu", runs=20):
+def benchmark_forward(model, input_sample, attention_mask, device="cpu", runs=20):
     model = model.to(device)
     input_sample = input_sample.to(device)
+    attention_mask = attention_mask.to(device)
     model.eval()
 
     torch.set_grad_enabled(False)
 
     # warmup
     for _ in range(3):
-        _ = model(input_sample)
+        _ = model(input_sample, attention_mask)
         if device.startswith("cuda"):
             torch.cuda.synchronize()
 
     times = []
     for _ in range(runs):
         start = time.time()
-        _ = model(input_sample)
+        _ = model(input_sample, attention_mask)
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         end = time.time()
@@ -30,12 +31,13 @@ if __name__ == "__main__":
     model1 = ...
     model2 = ...
 
-    dummy = torch.randint(0, 30000, (1, 2_000))
+    dummy = torch.randint(0, 30000, (1, 4_000))
+    attention_mask = torch.ones_like(dummy)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    t1 = benchmark_forward(model1, dummy, device)
-    t2 = benchmark_forward(model2, dummy, device)
+    t1 = benchmark_forward(model1, dummy, attention_mask, device)
+    t2 = benchmark_forward(model2, dummy, attention_mask, device)
 
     print(f"Model 1 avg time: {t1*1000:.3f} ms")
     print(f"Model 2 avg time: {t2*1000:.3f} ms")
