@@ -13,17 +13,17 @@ from torch.utils.data import IterableDataset
 from torch.nn.utils.rnn import pad_sequence
 
 INDEX = 0
-TORCH_COMPILE = True
+TORCH_COMPILE = False
 LONG_CONTEXT_TRAINING = False
 MAX_LENGTH = 4096 if not LONG_CONTEXT_TRAINING else 32768
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
 SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
-
+TOTAL_NUMBER_OF_STEPS = 100_000
 class Settings:
     lr_rate = 5e-5
     weight_decay = 0.1
-    batch_size = 16
+    batch_size = 2
 
 class CUDAPreFetch:
     def __init__(self, iter: IterableDataset, device: torch.device):
@@ -35,7 +35,10 @@ class CUDAPreFetch:
     def async_load(self):
 
         try:
-            batch = next(iter(self.iter))
+            if not hasattr(self, 'iterator'):
+                self.iterator = iter(self.iter)
+
+            batch = next(self.iterator)
         except StopIteration:
             self.next_batch = None
             return
@@ -113,6 +116,8 @@ class HFStreamDataset(IterableDataset):
                         buffer = buffer[MAX_LENGTH:]
                         batch.append(seq)
             else:
+                tokens = tokens[:MAX_LENGTH  - 1]
+                tokens += [self.eos_token]
                 batch.append(torch.tensor(tokens))
                 attention_masks.append(torch.ones(len(tokens)))
 
@@ -144,30 +149,25 @@ def perplexity(loss):
     nll_loss = loss.mean()
     return torch.exp(nll_loss)
 
-def apply_weight_decay(model, weight_decay = 0.1):
-    no_decay_params, decay_params = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-
-        if (
-            name.endswith("bias")
-            or "embedding" in name.lower()
-            or "norm" in name.lower()
-        ):
-            no_decay_params.append(param)
+def filter_ckpt_for_muon(ckpt, weight_decay = Settings.weight_decay):
+    muon_param, adamw_param = [], []
+    for name, param in ckpt.named_parameters():
+        if param.dim() < 2:
+            adamw_param.append(param)
         else:
-            decay_params.append(param)
+            muon_param.append(param)
 
     return [
-        {"params": no_decay_params, "weight_decay": 0.0},
-        {"params": decay_params, "weight_decay": weight_decay}
+        {"params": adamw_param, "weight_decay": 0.0},
+        {"params": muon_param, "weight_decay": weight_decay}
     ]
+    
             
 def main(local_rank, world_size):
 
     dist.init_process_group(backend='nccl', world_size = world_size, rank = local_rank)
 
+    torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
     dataset = HFStreamDataset(world_size=world_size, rank = local_rank)
@@ -176,15 +176,30 @@ def main(local_rank, world_size):
     config.rope_theta = ROPE_THETA
     config.context_length = MAX_LENGTH
     
-    model = Model(config).to(torch.float16)
+    model = Model(config, device).to(torch.bfloat16)
     prefetch = CUDAPreFetch(dataset, device)
+    prefetch.async_load()
 
-    optimizer = torch.optim.AdamW(apply_weight_decay(model, Settings.weight_decay), lr = Settings.lr_rate)
-    scaler = torch.amp.GradScaler(enabled = True)
+    model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank])
+    param_groups = filter_ckpt_for_muon(model.module, Settings.weight_decay)
+    
+    # Split the groups for each optimizer
+    adamw_groups = [group for group in param_groups if group['params'][0].dim() < 2]
+    muon_groups = [group for group in param_groups if group['params'][0].dim() >= 2]
+
+    main_optimizer = torch.optim.Muon(muon_groups, lr = Settings.lr_rate)
+    second_optimizer = torch.optim.AdamW(adamw_groups, lr = Settings.lr_rate)
+    scaler = torch.amp.GradScaler(enabled = False)
+
+    muon_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(main_optimizer, TOTAL_NUMBER_OF_STEPS)
+    adam_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(second_optimizer, TOTAL_NUMBER_OF_STEPS)
 
     if os.path.exists("model.pt"):
-        checkpoint = torch.load("model.pt")
-        model.load_state_dict(checkpoint)
+        try:
+            checkpoint = torch.load("model.pt")
+            model.load_state_dict(checkpoint, strict =  False)
+        except Exception as e:
+            print(e)
 
     # quantization
     if QAT_TRAINING:
@@ -203,32 +218,43 @@ def main(local_rank, world_size):
 
     step = 0
     # TODO: check if it skips the first batch
-    batch = prefetch.next().next()
+    batch = prefetch.next()#.next()
 
-    model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank])
 
     while batch is not None:
         inputs = batch
         next_batch = prefetch.next()
 
-        with torch.amp.autocast(enabled = True, device_type = "cuda"):
+        with torch.amp.autocast(enabled = True, device_type = f"cuda:{local_rank}", dtype=torch.bfloat16):
             input_ids, attention_mask = inputs
             logits = model(input_ids, attention_mask = attention_mask)
             loss = compute_clm_loss(logits, input_ids)
         
-        optimizer.zero_grad(set_to_none = True)
+        main_optimizer.zero_grad(set_to_none = True)
+        second_optimizer.zero_grad(set_to_none = True)
+
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
+
+        scaler.step(main_optimizer)
+        muon_scheduler.step()
+        scaler.step(second_optimizer)
+        adam_scheduler.step()
         scaler.update()
 
         if local_rank == 0 and step % 50 == 0:
             print(f"step {step:05d} | loss {loss.item():.4f}")
+
+        del input_ids, attention_mask, logits, loss
+        torch.cuda.synchronize(device)
 
         batch = next_batch
         step += 1
 
         if step % SAVE_EVERY_STEP == 0 and local_rank == 0:
             torch.save(model.state_dict(), f"model_{step}.pt")
+
+        if step == TOTAL_NUMBER_OF_STEPS:
+            break
 
     dist.destroy_process_group()
     

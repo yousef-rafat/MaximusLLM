@@ -5,19 +5,19 @@ import torch.nn as nn
 from transformers import DynamicCache, Cache, Gemma3TextConfig 
 
 class EmbeddingWithScale(nn.Embedding):
-    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int, embed_scale: float = 1.0):
-        super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
+    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int, embed_scale: float = 1.0, device=None):
+        super().__init__(num_embeddings, embedding_dim, padding_idx, device=device)
+        self.register_buffer("embed_scale", torch.tensor(embed_scale, device=device), persistent=False)
 
     def forward(self, input_ids: torch.Tensor):
         return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, device):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, device=device)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, device=device)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False, device=device)
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
@@ -26,10 +26,10 @@ class MLP(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, device=None):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        self.weight = nn.Parameter(torch.zeros(dim, device=device))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -45,13 +45,13 @@ def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
                       x2 * cos + x1 * sin], dim=-1)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, device):
         super().__init__()
+        self.device = device
         self.head_dim = config.head_dim
         self.base = config.base
         self.initial_context_length = config.initial_context_length
         self.ntk_alpha = config.ntk_alpha
-        self.device = config.device
 
     # dynamic ntk
     def _compute_inv_freq_dynamic(self, seq_len: int):
@@ -72,7 +72,7 @@ class RotaryEmbedding(nn.Module):
 
 class Attention(nn.Module):
 
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, device):
         super().__init__()
         self.is_latent = not (layer_idx in [0, config.num_hidden_layers // 2, config.num_hidden_layers])
         self.config = config
@@ -94,38 +94,39 @@ class Attention(nn.Module):
             self.scaling = config.query_pre_attn_scalar ** -0.5
 
             self.q_proj = nn.Linear(
-                config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+                config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias, device=device
             )
             self.k_proj = nn.Linear(
-                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias, device=device
             )
             self.v_proj = nn.Linear(
-                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+                config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias, device=device
             )
 
-            self.k_norm = RMSNorm(dim = config.head_dim, eps = config.rms_norm_eps)
-            self.q_norm = RMSNorm(dim = config.head_dim, eps = config.rms_norm_eps)
+            self.k_norm = RMSNorm(dim = config.head_dim, eps = config.rms_norm_eps, device=device)
+            self.q_norm = RMSNorm(dim = config.head_dim, eps = config.rms_norm_eps, device=device)
 
         else:
 
             self.scaling = self.head_dim ** -0.5
 
-            self.q_a = nn.Linear(config.hidden_size, config.q_lora_rank)
-            self.q_b = nn.Linear(config.q_lora_rank, self.head_dim * config.num_attention_heads)
+            self.q_a = nn.Linear(config.hidden_size, config.q_lora_rank, device=device)
+            self.q_b = nn.Linear(config.q_lora_rank, self.head_dim * config.num_attention_heads, device=device)
 
-            self.kv_a = nn.Linear(config.hidden_size, config.kv_lora_rank)
-            self.kv_b = nn.Linear(config.kv_lora_rank, (config.num_key_value_heads * self.head_dim) * 2)
+            self.kv_a = nn.Linear(config.hidden_size, config.kv_lora_rank, device=device)
+            self.kv_b = nn.Linear(config.kv_lora_rank, (config.num_key_value_heads * self.head_dim) * 2, device=device)
 
-            self.kv_norm = RMSNorm(dim = config.kv_lora_rank, eps = config.rms_norm_eps)
-            self.q_norm = RMSNorm(dim = config.q_lora_rank, eps = config.rms_norm_eps)
+            self.kv_norm = RMSNorm(dim = config.kv_lora_rank, eps = config.rms_norm_eps, device=device)
+            self.q_norm = RMSNorm(dim = config.q_lora_rank, eps = config.rms_norm_eps, device=device)
 
 
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias, device=device
         )
 
-        # start with strong RoPE bias
-        self.nope_logit = nn.Parameter(torch.tensor(-3.0))
+        if self.is_latent:
+            # start with strong RoPE bias
+            self.nope_logit = nn.Parameter(torch.tensor(-3.0))
 
         rope_logit = 0.5 # start with equal local and global rope
         logit = torch.log(torch.tensor(rope_logit) / (1.0 - torch.tensor(rope_logit)))
@@ -209,18 +210,18 @@ class Attention(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, device):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.attention_type = config.layer_types[layer_idx]
-        self.self_attn = Attention(config=config, layer_idx=layer_idx)
-        self.mlp = MLP(config)
-        self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = Attention(config=config, layer_idx=layer_idx, device= device)
+        self.mlp = MLP(config, device=device)
+        self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps, device=device)
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps, device=device)
+        self.pre_feedforward_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps, device=device)
+        self.post_feedforward_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps, device=device)
 
     def forward(
         self,
@@ -265,7 +266,7 @@ class DecoderLayer(nn.Module):
 
 class Model(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, device="cuda:0"):
         super().__init__()
 
         self.config = config
@@ -276,18 +277,19 @@ class Model(nn.Module):
 
 
         self.embed_tokens = EmbeddingWithScale(
-            config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5
+            config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5, device=device
         )
         self.layers = nn.ModuleList(
-            [DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [DecoderLayer(config, layer_idx, device) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = RotaryEmbedding(config=config)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, device = device)
+        self.rotary_emb = RotaryEmbedding(config=config, device = device)
 
         config = copy.deepcopy(config)
         config.rope_theta = config.rope_local_base_freq
-        self.rotary_emb_local = RotaryEmbedding(config=config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.rotary_emb_local = RotaryEmbedding(config=config, device = device)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, device=device)
+        self.gradient_checkpointing = True
 
         self.post_init()
 
@@ -335,17 +337,20 @@ class Model(nn.Module):
 
         hidden_states = inputs_embeds
         num_layers = self.config.num_hidden_layers
+        args = {"hidden_states": hidden_states,
+                "attention_mask": attention_mask,
+                "position_embeddings": positional_embeddings,
+                "past_key_values":past_key_values,
+                "use_cache":use_cache,
+                "cache_position":cache_position,
+                **kwargs
+        }
         for i, decoder_layer in enumerate(self.layers[: num_layers]):
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask = attention_mask,
-                position_embeddings = positional_embeddings,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                **kwargs,
-            )
+            
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = torch.utils.checkpoint.checkpoint(decoder_layer, **args, use_reentrant = False)
+            else:
+                layer_outputs = decoder_layer(**args)
 
             hidden_states = layer_outputs[0]
 
@@ -364,4 +369,3 @@ class Config(Gemma3TextConfig):
         self.base = 10_000
         self.initial_context_length = 4096
         self.ntk_alpha = 1.0
-
