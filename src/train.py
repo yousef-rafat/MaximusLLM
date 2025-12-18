@@ -11,7 +11,9 @@ import torch.ao.quantization as quant
 from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset
 from torch.nn.utils.rnn import pad_sequence
+import matplotlib.pyplot as plt
 
+losses = []
 INDEX = 0
 TORCH_COMPILE = False
 LONG_CONTEXT_TRAINING = False
@@ -26,43 +28,50 @@ class Settings:
     batch_size = 2
 
 class CUDAPreFetch:
-    def __init__(self, iter: IterableDataset, device: torch.device):
-        self.iter = iter
+    def __init__(self, iter_, device):
+        self.iter = iter(iter_)
         self.device = device
-        self.current_stream = torch.cuda.Stream()
+        self.stream = torch.cuda.Stream()
         self.next_batch = None
+        self._preload()
 
-    def async_load(self):
-
-        try:
-            if not hasattr(self, 'iterator'):
-                self.iterator = iter(self.iter)
-
-            batch = next(self.iterator)
-        except StopIteration:
-            self.next_batch = None
-            return
-
-        with torch.cuda.stream(self.current_stream):
-            self.next_batch = self.move(batch)
-        
     def move(self, x):
         if torch.is_tensor(x):
-            return x.to(self.device, non_blocking = True)
+            return x.pin_memory()
         elif isinstance(x, (list, tuple)):
             return type(x)(self.move(t) for t in x)
         elif isinstance(x, dict):
             return {k: self.move(v) for k, v in x.items()}
         else:
             return x
-    
-    def next(self):
-        # wait for the last batch to finish loading
-        torch.cuda.current_stream().wait_stream(self.current_stream)
-        batch = self.next_batch
 
-        self.async_load()
-        return batch
+    def _preload(self):
+        try:
+            batch = next(self.iter)
+        except StopIteration:
+            self.next_batch = None
+            return
+        self.next_batch = self.move(batch)
+
+    def _to_device_async(self, x):
+        if torch.is_tensor(x):
+            return x.to(self.device, non_blocking=True)
+        elif isinstance(x, (list, tuple)):
+            return type(x)(self._to_device_async(t) for t in x)
+        elif isinstance(x, dict):
+            return {k: self._to_device_async(v) for k, v in x.items()}
+        else:
+            return x
+
+    def next(self):
+        batch = self.next_batch
+        if batch is None:
+            return None
+        with torch.cuda.stream(self.stream):
+            batch_gpu = self._to_device_async(batch)
+        torch.cuda.current_stream().wait_stream(self.stream)
+        self._preload()
+        return batch_gpu
 
 class HFStreamDataset(IterableDataset):
     def __init__(self, dataset: str = "HuggingFaceFW/fineweb", take = None, rank = 0, world_size = 1):
@@ -116,7 +125,7 @@ class HFStreamDataset(IterableDataset):
                         buffer = buffer[MAX_LENGTH:]
                         batch.append(seq)
             else:
-                tokens = tokens[:MAX_LENGTH  - 1]
+                tokens = tokens[:MAX_LENGTH  - 2]
                 tokens += [self.eos_token]
                 batch.append(torch.tensor(tokens))
                 attention_masks.append(torch.ones(len(tokens)))
@@ -180,6 +189,13 @@ def main(local_rank, world_size):
     prefetch = CUDAPreFetch(dataset, device)
     prefetch.async_load()
 
+    model.train()
+    if TORCH_COMPILE:
+        model = model.to(device)
+        model = torch.compile(model, fullgraph = True, mode = "default")
+    else:
+        model = model.to(device)
+
     model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank])
     param_groups = filter_ckpt_for_muon(model.module, Settings.weight_decay)
     
@@ -209,13 +225,6 @@ def main(local_rank, world_size):
         quant.prepare_qat(model, inplace = True)
 
 
-    model.train()
-    if TORCH_COMPILE:
-        model = model.to(device)
-        model = torch.compile(model, fullgraph = True, mode = "default")
-    else:
-        model = model.to(device)
-
     step = 0
     # TODO: check if it skips the first batch
     batch = prefetch.next()#.next()
@@ -242,10 +251,11 @@ def main(local_rank, world_size):
         scaler.update()
 
         if local_rank == 0 and step % 50 == 0:
-            print(f"step {step:05d} | loss {loss.item():.4f}")
+            if step % 500:
+                print(f"step {step:05d} | loss {loss.item():.4f}")
+            losses.append(loss.detach().cpu())
 
         del input_ids, attention_mask, logits, loss
-        torch.cuda.synchronize(device)
 
         batch = next_batch
         step += 1
@@ -266,3 +276,5 @@ if __name__ == "__main__":
     os.environ["MASTER_PORT"] = "29500"
     world_size = torch.cuda.device_count()
     mp.spawn(main, args=(world_size,), nprocs=world_size, join=True)
+    plt.plot(losses)
+    plt.show()

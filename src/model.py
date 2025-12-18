@@ -289,6 +289,7 @@ class Model(nn.Module):
         config.rope_theta = config.rope_local_base_freq
         self.rotary_emb_local = RotaryEmbedding(config=config, device = device)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, device=device)
+        self.lm_head.weight = self.embed_tokens.weight
         self.gradient_checkpointing = True
 
         self.post_init()
