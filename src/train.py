@@ -33,7 +33,7 @@ class CUDAPreFetch:
         self.device = device
         self.stream = torch.cuda.Stream()
         self.next_batch = None
-        self._preload()
+        self.async_load()
 
     def move(self, x):
         if torch.is_tensor(x):
@@ -45,7 +45,7 @@ class CUDAPreFetch:
         else:
             return x
 
-    def _preload(self):
+    def async_load(self):
         try:
             batch = next(self.iter)
         except StopIteration:
@@ -70,7 +70,7 @@ class CUDAPreFetch:
         with torch.cuda.stream(self.stream):
             batch_gpu = self._to_device_async(batch)
         torch.cuda.current_stream().wait_stream(self.stream)
-        self._preload()
+        self.async_load()
         return batch_gpu
 
 class HFStreamDataset(IterableDataset):
