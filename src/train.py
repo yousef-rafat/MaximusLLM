@@ -22,10 +22,11 @@ ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
 SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
 TOTAL_NUMBER_OF_STEPS = 100_000
+ACCUM_STEPS = 128
 class Settings:
     lr_rate = 5e-5
     weight_decay = 0.1
-    batch_size = 2
+    batch_size = 8
 
 class CUDAPreFetch:
     def __init__(self, iter_, device):
@@ -144,15 +145,90 @@ class HFStreamDataset(IterableDataset):
         if batch:
             yield from return_batch(batch, attention_masks)
 
-def compute_clm_loss(logits, labels):
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
+# cce + gradient filtering
+class SparseCCE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden_states, W, target, chunk_size=4096):
+        ctx.save_for_backward(hidden_states, W, target)
+        ctx.chunk_size = chunk_size
+        
+        relevant_weights = W[target]
+        target_logits = torch.sum(hidden_states * relevant_weights, dim=1)
+        
+        N = hidden_states.size(0)
+        max_scores = torch.full((N,), float('-inf'), device=hidden_states.device, dtype=torch.float32)
+        sum_exp = torch.zeros(N, device=hidden_states.device, dtype=torch.float32)
+        
+        vocab_size = W.size(0)
+        
+        for i in range(0, vocab_size, chunk_size):
+            end = min(i + chunk_size, vocab_size)
+            W_chunk = W[i:end].T
+            
+            logits_chunk = torch.matmul(hidden_states, W_chunk)
+            logits_chunk = logits_chunk.float() # ensure higher precision for exp
+            
+            chunk_max, _ = torch.max(logits_chunk, dim=1)
+            new_max = torch.max(max_scores, chunk_max)
+            
+            exp_diff = torch.exp(max_scores - new_max)
+            chunk_sum = torch.sum(torch.exp(logits_chunk - new_max.unsqueeze(1)), dim=1)
+            sum_exp = sum_exp * exp_diff + chunk_sum
+            max_scores = new_max
+            
+        lse = max_scores + torch.log(sum_exp)
+        ctx.lse = lse
+        ctx.valid_tokens = (target != -100).sum()
+        
+        return (lse - target_logits.float()).sum() / ctx.valid_tokens
 
-    return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-        ignore_index = -100
-    )
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden_states, W, target = ctx.saved_tensors
+        lse = ctx.lse
+        chunk_size = ctx.chunk_size
+        valid_tokens = ctx.valid_tokens
+        
+        grad_hidden = torch.zeros_like(hidden_states)
+        grad_W = torch.zeros_like(W)
+        grad_scale = (grad_output / valid_tokens).float()
+        
+        relevant_weights = W[target]
+        grad_hidden.add_(relevant_weights, alpha=-grad_scale)
+        grad_W.index_add_(0, target, hidden_states, alpha=-grad_scale.to(hidden_states.dtype))
+
+        vocab_size = W.size(0)
+
+        sparsity_threshold = 10.0 
+        
+        min_lse = lse.min()
+        
+        for i in range(0, vocab_size, chunk_size):
+            end = min(i + chunk_size, vocab_size)
+            W_chunk = W[i:end].T
+            
+            logits_chunk = torch.matmul(hidden_states, W_chunk)
+            
+            chunk_max_val = logits_chunk.max()
+            
+            if chunk_max_val < (min_lse - sparsity_threshold):
+                continue
+
+            softmax_chunk = torch.exp(logits_chunk.float() - lse.unsqueeze(1)) * grad_scale
+            softmax_chunk = softmax_chunk.to(hidden_states.dtype)
+
+            grad_hidden.addmm_(softmax_chunk, W_chunk.T)
+            grad_W[i:end].addmm_(softmax_chunk.T, hidden_states)
+            
+        return grad_hidden, grad_W, None, None
+
+def cce_loss(hidden, W, targets, chunk_size=4096):
+    h = hidden[:, :-1, :].reshape(-1, hidden.size(-1))
+    t = targets[:, 1:].reshape(-1)
+    mask = t != -100
+    h = h[mask]
+    t = t[mask]
+    return SparseCCE.apply(h, W, t, chunk_size)
 
 def perplexity(loss):
     nll_loss = loss.mean()
@@ -178,6 +254,7 @@ def main(local_rank, world_size):
 
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
+    dtype = torch.float16
 
     dataset = HFStreamDataset(world_size=world_size, rank = local_rank)
     config = Config.from_pretrained("google/gemma-3-270m", token = "")
@@ -185,7 +262,8 @@ def main(local_rank, world_size):
     config.rope_theta = ROPE_THETA
     config.context_length = MAX_LENGTH
     
-    model = Model(config, device).to(torch.bfloat16)
+    # for muons stability, we init the model to fp32
+    model = Model(config, device).float()
     prefetch = CUDAPreFetch(dataset, device)
     prefetch.async_load()
 
@@ -196,7 +274,7 @@ def main(local_rank, world_size):
     else:
         model = model.to(device)
 
-    model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank])
+    model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank], find_unused_parameters=True)
     param_groups = filter_ckpt_for_muon(model.module, Settings.weight_decay)
     
     # Split the groups for each optimizer
@@ -234,26 +312,37 @@ def main(local_rank, world_size):
         inputs = batch
         next_batch = prefetch.next()
 
-        with torch.amp.autocast(enabled = True, device_type = f"cuda:{local_rank}", dtype=torch.bfloat16):
-            input_ids, attention_mask = inputs
-            logits = model(input_ids, attention_mask = attention_mask)
-            loss = compute_clm_loss(logits, input_ids)
+        is_sync_step = ((step + 1) % ACCUM_STEPS == 0) or (next_batch is None)
+        context = model.no_sync() if not is_sync_step else torch.enable_grad()
         
-        main_optimizer.zero_grad(set_to_none = True)
-        second_optimizer.zero_grad(set_to_none = True)
+        with context:
+            with torch.amp.autocast(enabled = True, device_type = f"cuda:{local_rank}", dtype=dtype):
+                input_ids, attention_mask = inputs
+                logits = model(input_ids, attention_mask = attention_mask, return_hidden=True)
+                loss = cce_loss(logits, model.module.lm_head.weight, input_ids)
 
         scaler.scale(loss).backward()
 
-        scaler.step(main_optimizer)
-        muon_scheduler.step()
-        scaler.step(second_optimizer)
-        adam_scheduler.step()
-        scaler.update()
+        if (step + 1) % ACCUM_STEPS == 0:
+            
+            scaler.unscale_(main_optimizer)
+            scaler.unscale_(second_optimizer)
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            scaler.step(main_optimizer)
+            scaler.step(second_optimizer)
+            scaler.update()
+            
+            main_optimizer.zero_grad(set_to_none = True)
+            second_optimizer.zero_grad(set_to_none = True)
+            
+            muon_scheduler.step()
+            adam_scheduler.step()
 
-        if local_rank == 0 and step % 50 == 0:
-            if step % 500:
+            if local_rank == 0 and step % 1000 == 0:
                 print(f"step {step:05d} | loss {loss.item():.4f}")
-            losses.append(loss.detach().cpu())
+                losses.append(loss.detach().cpu())
 
         del input_ids, attention_mask, logits, loss
 

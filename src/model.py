@@ -290,7 +290,7 @@ class Model(nn.Module):
         self.rotary_emb_local = RotaryEmbedding(config=config, device = device)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, device=device)
         self.lm_head.weight = self.embed_tokens.weight
-        self.gradient_checkpointing = True
+        self.gradient_checkpointing = False
 
         self.post_init()
 
@@ -309,6 +309,7 @@ class Model(nn.Module):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        return_hidden = False,
         **kwargs,
     ):
 
@@ -356,6 +357,8 @@ class Model(nn.Module):
             hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
+        if return_hidden:
+            return hidden_states
         logits = self.lm_head(hidden_states)
 
         return logits
