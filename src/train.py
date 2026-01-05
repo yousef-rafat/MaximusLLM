@@ -3,21 +3,23 @@ import torch
 import random
 from model import Model, Config
 from itertools import islice
-import torch.nn.functional as F
 import torch.distributed as dist
 from datasets import load_dataset
 import torch.multiprocessing as mp
 import torch.ao.quantization as quant
-from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset
 from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
+from transformers import AutoTokenizer
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
+from contextlib import nullcontext
 
 losses = []
 INDEX = 0
-TORCH_COMPILE = False
+TORCH_COMPILE = True
 LONG_CONTEXT_TRAINING = False
-MAX_LENGTH = 4096 if not LONG_CONTEXT_TRAINING else 32768
+MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 32768
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
 SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
@@ -26,7 +28,8 @@ ACCUM_STEPS = 128
 class Settings:
     lr_rate = 5e-5
     weight_decay = 0.1
-    batch_size = 8
+    batch_size = 2
+    chunk_size_cce = 512
 
 class CUDAPreFetch:
     def __init__(self, iter_, device):
@@ -75,12 +78,17 @@ class CUDAPreFetch:
         return batch_gpu
 
 class HFStreamDataset(IterableDataset):
-    def __init__(self, dataset: str = "HuggingFaceFW/fineweb", take = None, rank = 0, world_size = 1):
+    def __init__(self, dataset: str = "HuggingFaceFW/fineweb", take = None, rank = 0, world_size = 1, max_retries = 5):
 
         self.rank = rank
         self.world_size = world_size
 
-        dataset = load_dataset(dataset, name = "CC-MAIN-2024-10", split = "train", streaming = True)
+        for _ in range(0, max_retries):
+            try:
+                dataset = load_dataset(dataset, name = "CC-MAIN-2024-10", split = "train", streaming = True)
+                break
+            except:
+                continue
         self.dataset = islice(dataset, INDEX, None)
         self.tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m", token = "") # requires a token
         self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
@@ -194,8 +202,9 @@ class SparseCCE(torch.autograd.Function):
         grad_scale = (grad_output / valid_tokens).float()
         
         relevant_weights = W[target]
-        grad_hidden.add_(relevant_weights, alpha=-grad_scale)
-        grad_W.index_add_(0, target, hidden_states, alpha=-grad_scale.to(hidden_states.dtype))
+        mask = target != -100
+        grad_hidden.add_(relevant_weights, alpha=-grad_scale.item())
+        grad_W.index_add_(0, target[mask], hidden_states[mask], alpha=-grad_scale.to(hidden_states.dtype).item())
 
         vocab_size = W.size(0)
 
@@ -222,12 +231,19 @@ class SparseCCE(torch.autograd.Function):
             
         return grad_hidden, grad_W, None, None
 
-def cce_loss(hidden, W, targets, chunk_size=4096):
+def cce_loss(hidden, W, targets, chunk_size=Settings.chunk_size_cce):
     h = hidden[:, :-1, :].reshape(-1, hidden.size(-1))
     t = targets[:, 1:].reshape(-1)
-    mask = t != -100
+    
+    vocab_size = W.size(0)
+    mask = (t != -100) & (t >= 0) & (t < vocab_size)
+    
     h = h[mask]
     t = t[mask]
+    
+    if t.numel() == 0:
+        return torch.tensor(0.0, device=hidden.device, requires_grad=True)
+        
     return SparseCCE.apply(h, W, t, chunk_size)
 
 def perplexity(loss):
@@ -245,8 +261,7 @@ def filter_ckpt_for_muon(ckpt, weight_decay = Settings.weight_decay):
     return [
         {"params": adamw_param, "weight_decay": 0.0},
         {"params": muon_param, "weight_decay": weight_decay}
-    ]
-    
+    ] 
             
 def main(local_rank, world_size):
 
@@ -266,6 +281,7 @@ def main(local_rank, world_size):
     model = Model(config, device).float()
     prefetch = CUDAPreFetch(dataset, device)
     prefetch.async_load()
+    model.gradient_checkpointing = True
 
     model.train()
     if TORCH_COMPILE:
@@ -274,7 +290,7 @@ def main(local_rank, world_size):
     else:
         model = model.to(device)
 
-    model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank], find_unused_parameters=True)
+    model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank], find_unused_parameters=False)
     param_groups = filter_ckpt_for_muon(model.module, Settings.weight_decay)
     
     # Split the groups for each optimizer
@@ -291,9 +307,20 @@ def main(local_rank, world_size):
     if os.path.exists("model.pt"):
         try:
             checkpoint = torch.load("model.pt")
-            model.load_state_dict(checkpoint, strict =  False)
+            model.module.load_state_dict(checkpoint, strict =  False)
         except Exception as e:
             print(e)
+    else:
+        checkpoint = load_file(hf_hub_download(repo_id="google/gemma-3-270m", filename = "model.safetensors", local_dir = ".", token=""))
+        new_state_dict = {}
+        for key, value in checkpoint.items():
+            if key.startswith("model."):
+                new_key = key[6:] 
+            else:
+                new_key = key
+            new_state_dict[new_key] = value
+        model.module.load_state_dict(new_state_dict, strict = False)
+        del new_state_dict, checkpoint
 
     # quantization
     if QAT_TRAINING:
@@ -307,21 +334,22 @@ def main(local_rank, world_size):
     # TODO: check if it skips the first batch
     batch = prefetch.next()#.next()
 
-
     while batch is not None:
         inputs = batch
         next_batch = prefetch.next()
 
-        is_sync_step = ((step + 1) % ACCUM_STEPS == 0) or (next_batch is None)
-        context = model.no_sync() if not is_sync_step else torch.enable_grad()
-        
-        with context:
+        is_update_step = ((step + 1) % ACCUM_STEPS == 0) or (next_batch is None)
+        sync_context = model.no_sync() if not is_update_step else nullcontext()
+
+        with sync_context:
             with torch.amp.autocast(enabled = True, device_type = f"cuda:{local_rank}", dtype=dtype):
                 input_ids, attention_mask = inputs
                 logits = model(input_ids, attention_mask = attention_mask, return_hidden=True)
                 loss = cce_loss(logits, model.module.lm_head.weight, input_ids)
+    
+                loss = loss / ACCUM_STEPS
 
-        scaler.scale(loss).backward()
+            scaler.scale(loss).backward()
 
         if (step + 1) % ACCUM_STEPS == 0:
             
@@ -341,7 +369,7 @@ def main(local_rank, world_size):
             adam_scheduler.step()
 
             if local_rank == 0 and step % 1000 == 0:
-                print(f"step {step:05d} | loss {loss.item():.4f}")
+                print(f"step {(step // ACCUM_STEPS):05d} | loss {(loss.item() * ACCUM_STEPS):.4f}")
                 losses.append(loss.detach().cpu())
 
         del input_ids, attention_mask, logits, loss

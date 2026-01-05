@@ -4,6 +4,28 @@ from typing import *
 import torch.nn as nn
 from transformers import DynamicCache, Cache, Gemma3TextConfig 
 
+def create_causal_padding_mask(attention_mask, seq_len, dtype, device):
+
+    batch_size = attention_mask.shape[0]
+    causal_mask = torch.triu(
+        torch.ones((1, 1, seq_len, seq_len), device=device, dtype=torch.bool), 
+        diagonal=1
+    )
+    
+    padding_mask = (attention_mask[:, None, None, :] == 0)
+    combined_mask = causal_mask | padding_mask
+
+    if dtype == torch.float16:
+        min_val = -65500.0
+    elif dtype == torch.bfloat16:
+        min_val = -3.4e38
+    else:
+        min_val = -1e9
+
+    final_mask = torch.zeros((batch_size, 1, seq_len, seq_len), device=device, dtype=dtype)
+    final_mask = final_mask.masked_fill(combined_mask, min_val)
+    
+    return final_mask  
 class EmbeddingWithScale(nn.Embedding):
     def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int, embed_scale: float = 1.0, device=None):
         super().__init__(num_embeddings, embedding_dim, padding_idx, device=device)
@@ -117,7 +139,7 @@ class Attention(nn.Module):
             self.kv_b = nn.Linear(config.kv_lora_rank, (config.num_key_value_heads * self.head_dim) * 2, device=device)
 
             self.kv_norm = RMSNorm(dim = config.kv_lora_rank, eps = config.rms_norm_eps, device=device)
-            self.q_norm = RMSNorm(dim = config.q_lora_rank, eps = config.rms_norm_eps, device=device)
+            self.q_norm_latent = RMSNorm(dim = config.q_lora_rank, eps = config.rms_norm_eps, device=device)
 
 
         self.o_proj = nn.Linear(
@@ -148,7 +170,7 @@ class Attention(nn.Module):
         cos, sin = freqs_cis
 
         # query
-        q = self.q_b(self.q_norm(self.q_a(hidden_states)))
+        q = self.q_b(self.q_norm_latent(self.q_a(hidden_states)))
         q = q.view(q.size(0), -1, self.num_heads, self.head_dim)
         q_pe = _apply_rotary_emb(q, cos, sin)
 
@@ -201,8 +223,13 @@ class Attention(nn.Module):
         if value_states.ndim == 3:
             value_states = value_states.unsqueeze(2)
 
-        attention_mask = attention_mask[:, :, None, None]
-        attn_output = nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = attention_mask)
+        query_states, key_states, value_states = [t.transpose(1, 2) for t in (query_states, key_states, value_states)]
+
+        if attention_mask is not None:
+            attention_mask = create_causal_padding_mask(
+                attention_mask, query_states.size(2), device=query_states.device, dtype=query_states.dtype
+            )
+        attn_output = nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = attention_mask, is_causal=False)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -260,7 +287,7 @@ class DecoderLayer(nn.Module):
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        outputs = hidden_states
 
         return outputs
 
@@ -295,11 +322,14 @@ class Model(nn.Module):
         self.post_init()
 
     def post_init(self):
+        std = 0.02
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.kaiming_uniform_(module.weight, a=0.01)
+                module.weight.data.normal_(mean=0.0, std=std)
                 if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+                    module.bias.data.zero_()
+            elif isinstance(module, nn.Embedding):
+                module.weight.data.normal_(mean=0.0, std=std)
 
     def forward(
         self,
@@ -339,22 +369,20 @@ class Model(nn.Module):
 
         hidden_states = inputs_embeds
         num_layers = self.config.num_hidden_layers
-        args = {"hidden_states": hidden_states,
-                "attention_mask": attention_mask,
-                "position_embeddings": positional_embeddings,
-                "past_key_values":past_key_values,
-                "use_cache":use_cache,
-                "cache_position":cache_position,
-                **kwargs
+        model_args = {
+            "attention_mask": attention_mask,
+            "position_embeddings": positional_embeddings,
+            "past_key_values":past_key_values,
+            "use_cache":use_cache,
+            "cache_position":cache_position,
+            **kwargs
         }
         for i, decoder_layer in enumerate(self.layers[: num_layers]):
             
             if self.gradient_checkpointing and self.training:
-                layer_outputs = torch.utils.checkpoint.checkpoint(decoder_layer, **args, use_reentrant = False)
+                hidden_states = torch.utils.checkpoint.checkpoint(decoder_layer, hidden_states=hidden_states, **model_args, use_reentrant = False)
             else:
-                layer_outputs = decoder_layer(**args)
-
-            hidden_states = layer_outputs[0]
+                hidden_states = decoder_layer(hidden_states=hidden_states, **model_args)
 
         hidden_states = self.norm(hidden_states)
         if return_hidden:
