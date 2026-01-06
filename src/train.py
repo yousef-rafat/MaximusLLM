@@ -24,11 +24,13 @@ ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
 SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
 TOTAL_NUMBER_OF_STEPS = 100_000
-ACCUM_STEPS = 128
+ACCUM_STEPS = 32
+PACKING = True
+
 class Settings:
     lr_rate = 5e-5
     weight_decay = 0.1
-    batch_size = 2
+    batch_size = 8
     chunk_size_cce = 512
 
 class CUDAPreFetch:
@@ -77,6 +79,21 @@ class CUDAPreFetch:
         self.async_load()
         return batch_gpu
 
+def diagonal_attn_mask(seq, eos_token):
+    T = len(seq)
+    is_eos = (seq == eos_token)
+    doc_ids = is_eos.cumsum(0).roll(1)
+    doc_ids[0] = 0 
+    
+    row = doc_ids.unsqueeze(0).expand(T, T)
+    col = doc_ids.unsqueeze(1).expand(T, T)
+    diff_doc_mask = (row != col)
+
+    causal_mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+    
+    combined_mask = diff_doc_mask | causal_mask
+    return combined_mask
+
 class HFStreamDataset(IterableDataset):
     def __init__(self, dataset: str = "HuggingFaceFW/fineweb", take = None, rank = 0, world_size = 1, max_retries = 5):
 
@@ -102,8 +119,12 @@ class HFStreamDataset(IterableDataset):
         attention_masks = []
 
         def return_batch(batch, attention_masks = None):
-            if LONG_CONTEXT_TRAINING:
-                yield torch.tensor(batch, dtype=torch.long), torch.ones_like(batch)
+            if LONG_CONTEXT_TRAINING or PACKING:
+                if isinstance(batch, list):
+                    batch = torch.stack(batch)
+                else: 
+                    batch = torch.tensor(batch, dtype=torch.long)
+                yield batch, torch.ones_like(batch)
             else:
                 yield pad_sequence(batch, batch_first = True), pad_sequence(attention_masks, batch_first = True, padding_value = 0)
 
@@ -114,8 +135,20 @@ class HFStreamDataset(IterableDataset):
 
             tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
 
+            if PACKING:
+                tokens.append(self.eos_token)
+                buffer.extend(tokens)
+
+                while len(buffer) >= MAX_LENGTH:
+                    seq = buffer[:MAX_LENGTH]
+                    buffer = buffer[MAX_LENGTH:]
+                    batch.append(torch.tensor(seq, dtype=torch.long))
+
+                    if len(batch) == batch_size:
+                        yield from return_batch(batch)
+                        batch = []
             # TODO: should mix long, short, and medium sequence lengths
-            if LONG_CONTEXT_TRAINING:
+            elif LONG_CONTEXT_TRAINING:
                 # random start if longer than MAX_LENGTH
                 if len(tokens) > MAX_LENGTH:
                     start = random.randint(0, len(tokens) - (MAX_LENGTH - 1))
@@ -146,11 +179,26 @@ class HFStreamDataset(IterableDataset):
                 attention_masks = []
 
         # remaining tokens
-        if buffer:
+        if buffer and not PACKING:
             batch.append(buffer[:MAX_LENGTH])
+        elif PACKING and buffer: # having consistent shapes -> better memory usuage with torch.compile
+            seq = torch.tensor(buffer, dtype=torch.long)
+            pad_len = MAX_LENGTH - len(seq)
+            if pad_len > 0:
+                mask = torch.cat([torch.ones(len(seq)), torch.zeros(pad_len)])
+                seq = torch.nn.functional.pad(seq, (0, pad_len), value=self.tokenizer.pad_token_id or 0)
+                
+                batch.append(seq)
+                attention_masks = [mask]
+            else:
+                batch.append(seq)
+                attention_masks = []
 
         # last partial batch
         if batch:
+            if PACKING and attention_masks:
+                while len(attention_masks) < len(batch):
+                    attention_masks.insert(0, torch.ones(MAX_LENGTH))
             yield from return_batch(batch, attention_masks)
 
 # cce + gradient filtering
@@ -286,7 +334,7 @@ def main(local_rank, world_size):
     model.train()
     if TORCH_COMPILE:
         model = model.to(device)
-        model = torch.compile(model, fullgraph = True, mode = "default")
+        model = torch.compile(model, fullgraph = True, mode = "reduce-overhead")
     else:
         model = model.to(device)
 

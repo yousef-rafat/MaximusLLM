@@ -6,6 +6,18 @@ from transformers import DynamicCache, Cache, Gemma3TextConfig
 
 def create_causal_padding_mask(attention_mask, seq_len, dtype, device):
 
+    if dtype == torch.float16:
+        min_val = -65500.0
+    elif dtype == torch.bfloat16:
+        min_val = -3.4e38
+    else:
+        min_val = -1e9
+
+    if attention_mask.dim() > 3: # packing
+        final_mask = torch.zeros_like(attention_mask, dtype=dtype, device=device)        
+        final_mask = final_mask.masked_fill(attention_mask, min_val)
+        return final_mask
+
     batch_size = attention_mask.shape[0]
     causal_mask = torch.triu(
         torch.ones((1, 1, seq_len, seq_len), device=device, dtype=torch.bool), 
@@ -15,17 +27,12 @@ def create_causal_padding_mask(attention_mask, seq_len, dtype, device):
     padding_mask = (attention_mask[:, None, None, :] == 0)
     combined_mask = causal_mask | padding_mask
 
-    if dtype == torch.float16:
-        min_val = -65500.0
-    elif dtype == torch.bfloat16:
-        min_val = -3.4e38
-    else:
-        min_val = -1e9
 
     final_mask = torch.zeros((batch_size, 1, seq_len, seq_len), device=device, dtype=dtype)
     final_mask = final_mask.masked_fill(combined_mask, min_val)
     
     return final_mask  
+
 class EmbeddingWithScale(nn.Embedding):
     def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int, embed_scale: float = 1.0, device=None):
         super().__init__(num_embeddings, embedding_dim, padding_idx, device=device)
