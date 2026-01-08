@@ -14,6 +14,7 @@ from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from contextlib import nullcontext
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
 losses = []
 INDEX = 0
@@ -201,99 +202,6 @@ class HFStreamDataset(IterableDataset):
                     attention_masks.insert(0, torch.ones(MAX_LENGTH))
             yield from return_batch(batch, attention_masks)
 
-# cce + gradient filtering
-class SparseCCE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, hidden_states, W, target, chunk_size=4096):
-        ctx.save_for_backward(hidden_states, W, target)
-        ctx.chunk_size = chunk_size
-        
-        relevant_weights = W[target]
-        target_logits = torch.sum(hidden_states * relevant_weights, dim=1)
-        
-        N = hidden_states.size(0)
-        max_scores = torch.full((N,), float('-inf'), device=hidden_states.device, dtype=torch.float32)
-        sum_exp = torch.zeros(N, device=hidden_states.device, dtype=torch.float32)
-        
-        vocab_size = W.size(0)
-        
-        for i in range(0, vocab_size, chunk_size):
-            end = min(i + chunk_size, vocab_size)
-            W_chunk = W[i:end].T
-            
-            logits_chunk = torch.matmul(hidden_states, W_chunk)
-            logits_chunk = logits_chunk.float() # ensure higher precision for exp
-            
-            chunk_max, _ = torch.max(logits_chunk, dim=1)
-            new_max = torch.max(max_scores, chunk_max)
-            
-            exp_diff = torch.exp(max_scores - new_max)
-            chunk_sum = torch.sum(torch.exp(logits_chunk - new_max.unsqueeze(1)), dim=1)
-            sum_exp = sum_exp * exp_diff + chunk_sum
-            max_scores = new_max
-            
-        lse = max_scores + torch.log(sum_exp)
-        ctx.lse = lse
-        ctx.valid_tokens = (target != -100).sum()
-        
-        return (lse - target_logits.float()).sum() / ctx.valid_tokens
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        hidden_states, W, target = ctx.saved_tensors
-        lse = ctx.lse
-        chunk_size = ctx.chunk_size
-        valid_tokens = ctx.valid_tokens
-        
-        grad_hidden = torch.zeros_like(hidden_states)
-        grad_W = torch.zeros_like(W)
-        grad_scale = (grad_output / valid_tokens).float()
-        
-        relevant_weights = W[target]
-        mask = target != -100
-        grad_hidden.add_(relevant_weights, alpha=-grad_scale.item())
-        grad_W.index_add_(0, target[mask], hidden_states[mask], alpha=-grad_scale.to(hidden_states.dtype).item())
-
-        vocab_size = W.size(0)
-
-        sparsity_threshold = 10.0 
-        
-        min_lse = lse.min()
-        
-        for i in range(0, vocab_size, chunk_size):
-            end = min(i + chunk_size, vocab_size)
-            W_chunk = W[i:end].T
-            
-            logits_chunk = torch.matmul(hidden_states, W_chunk)
-            
-            chunk_max_val = logits_chunk.max()
-            
-            if chunk_max_val < (min_lse - sparsity_threshold):
-                continue
-
-            softmax_chunk = torch.exp(logits_chunk.float() - lse.unsqueeze(1)) * grad_scale
-            softmax_chunk = softmax_chunk.to(hidden_states.dtype)
-
-            grad_hidden.addmm_(softmax_chunk, W_chunk.T)
-            grad_W[i:end].addmm_(softmax_chunk.T, hidden_states)
-            
-        return grad_hidden, grad_W, None, None
-
-def cce_loss(hidden, W, targets, chunk_size=Settings.chunk_size_cce):
-    h = hidden[:, :-1, :].reshape(-1, hidden.size(-1))
-    t = targets[:, 1:].reshape(-1)
-    
-    vocab_size = W.size(0)
-    mask = (t != -100) & (t >= 0) & (t < vocab_size)
-    
-    h = h[mask]
-    t = t[mask]
-    
-    if t.numel() == 0:
-        return torch.tensor(0.0, device=hidden.device, requires_grad=True)
-        
-    return SparseCCE.apply(h, W, t, chunk_size)
-
 def perplexity(loss):
     nll_loss = loss.mean()
     return torch.exp(nll_loss)
@@ -330,6 +238,7 @@ def main(local_rank, world_size):
     prefetch = CUDAPreFetch(dataset, device)
     prefetch.async_load()
     model.gradient_checkpointing = True
+    criterion = LigerFusedLinearCrossEntropyLoss()
 
     model.train()
     if TORCH_COMPILE:
@@ -352,9 +261,9 @@ def main(local_rank, world_size):
     muon_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(main_optimizer, TOTAL_NUMBER_OF_STEPS)
     adam_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(second_optimizer, TOTAL_NUMBER_OF_STEPS)
 
-    if os.path.exists("model.pt"):
+    if os.path.exists("model.safetensors"):
         try:
-            checkpoint = torch.load("model.pt")
+            checkpoint = torch.load("model.safetensors")
             model.module.load_state_dict(checkpoint, strict =  False)
         except Exception as e:
             print(e)
@@ -393,7 +302,11 @@ def main(local_rank, world_size):
             with torch.amp.autocast(enabled = True, device_type = f"cuda:{local_rank}", dtype=dtype):
                 input_ids, attention_mask = inputs
                 logits = model(input_ids, attention_mask = attention_mask, return_hidden=True)
-                loss = cce_loss(logits, model.module.lm_head.weight, input_ids)
+                loss = criterion(
+                    model.module.lm_head.weight, 
+                    logits.view(-1, model.module.config.hidden_size), 
+                    input_ids.long().reshape(-1)
+                )
     
                 loss = loss / ACCUM_STEPS
 
