@@ -39,9 +39,9 @@ def lr_scheduler_fn(optimizer, min_lr = 0.1):
             return float(current_step) / float(WARMUP)
         decay_step = current_step - (STABLE + WARMUP)
         decay_progress = float(decay_step) / float(DECAY)
-        return max(0.1, 1 - decay_progress)
+        return max(min_lr, 1 - decay_progress) # avoids 0
 
-    return torch.optim.lr_scheduler.Lambda(optimizer, scheduler)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, scheduler)
 
 class Settings:
     lr_rate = 5e-5
