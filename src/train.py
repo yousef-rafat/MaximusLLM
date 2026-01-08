@@ -107,7 +107,7 @@ class HFStreamDataset(IterableDataset):
             except:
                 continue
         self.dataset = islice(dataset, INDEX, None)
-        self.tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-270m", token = "") # requires a token
+        self.tokenizer = AutoTokenizer.from_pretrained("yousefg/MaximusLLM")
         self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
 
         if take is not None:
@@ -320,7 +320,7 @@ def main(local_rank, world_size):
     dtype = torch.float16
 
     dataset = HFStreamDataset(world_size=world_size, rank = local_rank)
-    config = Config.from_pretrained("google/gemma-3-270m", token = "")
+    config = Config.from_pretrained("yousefg/MaximusLLM")
 
     config.rope_theta = ROPE_THETA
     config.context_length = MAX_LENGTH
@@ -359,7 +359,7 @@ def main(local_rank, world_size):
         except Exception as e:
             print(e)
     else:
-        checkpoint = load_file(hf_hub_download(repo_id="google/gemma-3-270m", filename = "model.safetensors", local_dir = ".", token=""))
+        checkpoint = load_file(hf_hub_download(repo_id="yousefg/MaximusLLM", filename = "model.safetensors", local_dir = "."))
         new_state_dict = {}
         for key, value in checkpoint.items():
             if key.startswith("model."):
@@ -416,7 +416,7 @@ def main(local_rank, world_size):
             muon_scheduler.step()
             adam_scheduler.step()
 
-            if local_rank == 0 and step % 1000 == 0:
+            if local_rank == 0 and ((step + 1) // ACCUM_STEPS) % 10 == 0:
                 print(f"step {(step // ACCUM_STEPS):05d} | loss {(loss.item() * ACCUM_STEPS):.4f}")
                 losses.append(loss.detach().cpu())
 
