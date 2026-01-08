@@ -27,6 +27,21 @@ QAT_TRAINING = False
 TOTAL_NUMBER_OF_STEPS = 100_000
 ACCUM_STEPS = 32
 PACKING = True
+WARMUP = (TOTAL_NUMBER_OF_STEPS * 0.05)
+DECAY = (TOTAL_NUMBER_OF_STEPS * 0.1)
+STABLE = (TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY))
+
+def lr_scheduler_fn(optimizer, min_lr = 0.1):
+    def scheduler(current_step):
+        if current_step > (WARMUP + STABLE):
+            return 1.0
+        if current_step < WARMUP:
+            return float(current_step) / float(WARMUP)
+        decay_step = current_step - (STABLE + WARMUP)
+        decay_progress = float(decay_step) / float(DECAY)
+        return max(0.1, 1 - decay_progress)
+
+    return torch.optim.lr_scheduler.Lambda(optimizer, scheduler)
 
 class Settings:
     lr_rate = 5e-5
@@ -258,8 +273,8 @@ def main(local_rank, world_size):
     second_optimizer = torch.optim.AdamW(adamw_groups, lr = Settings.lr_rate)
     scaler = torch.amp.GradScaler(enabled = False)
 
-    muon_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(main_optimizer, TOTAL_NUMBER_OF_STEPS)
-    adam_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(second_optimizer, TOTAL_NUMBER_OF_STEPS)
+    muon_scheduler = lr_scheduler_fn(main_optimizer)
+    adam_scheduler = lr_scheduler_fn(second_optimizer)
 
     if os.path.exists("model.safetensors"):
         try:
