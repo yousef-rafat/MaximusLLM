@@ -33,7 +33,7 @@ STABLE = (TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY))
 
 def lr_scheduler_fn(optimizer, min_lr = 0.1):
     def scheduler(current_step):
-        if current_step > (WARMUP + STABLE):
+        if current_step < (WARMUP + STABLE):
             return 1.0
         if current_step < WARMUP:
             return float(current_step) / float(WARMUP)
@@ -44,7 +44,7 @@ def lr_scheduler_fn(optimizer, min_lr = 0.1):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, scheduler)
 
 class Settings:
-    lr_rate = 5e-5
+    lr_rate = 5e-4
     weight_decay = 0.1
     batch_size = 8
     chunk_size_cce = 512
