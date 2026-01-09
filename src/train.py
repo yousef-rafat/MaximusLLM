@@ -33,10 +33,10 @@ STABLE = (TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY))
 
 def lr_scheduler_fn(optimizer, min_lr = 0.1):
     def scheduler(current_step):
-        if current_step < (WARMUP + STABLE):
-            return 1.0
         if current_step < WARMUP:
             return float(current_step) / float(WARMUP)
+        if current_step < (WARMUP + STABLE):
+            return 1.0
         decay_step = current_step - (STABLE + WARMUP)
         decay_progress = float(decay_step) / float(DECAY)
         return max(min_lr, 1 - decay_progress) # avoids 0
@@ -44,10 +44,10 @@ def lr_scheduler_fn(optimizer, min_lr = 0.1):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, scheduler)
 
 class Settings:
-    lr_rate = 5e-4
     weight_decay = 0.1
     batch_size = 8
-    chunk_size_cce = 512
+    muon_lr = 0.01
+    adamw_rate = 5e-4
 
 class CUDAPreFetch:
     def __init__(self, iter_, device):
@@ -269,8 +269,8 @@ def main(local_rank, world_size):
     adamw_groups = [group for group in param_groups if group['params'][0].dim() < 2]
     muon_groups = [group for group in param_groups if group['params'][0].dim() >= 2]
 
-    main_optimizer = torch.optim.Muon(muon_groups, lr = Settings.lr_rate)
-    second_optimizer = torch.optim.AdamW(adamw_groups, lr = Settings.lr_rate)
+    main_optimizer = torch.optim.Muon(muon_groups, lr = Settings.muon_lr)
+    second_optimizer = torch.optim.AdamW(adamw_groups, lr = Settings.adamw_rate)
     scaler = torch.amp.GradScaler(enabled = False)
 
     muon_scheduler = lr_scheduler_fn(main_optimizer)
