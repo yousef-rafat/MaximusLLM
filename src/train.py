@@ -12,9 +12,10 @@ from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from contextlib import nullcontext
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+from utils import update_model_hf
 
 losses = []
 INDEX = 0
@@ -355,7 +356,7 @@ def main(local_rank, world_size):
         step += 1
 
         if step % SAVE_EVERY_STEP == 0 and local_rank == 0:
-            torch.save(model.state_dict(), f"model_{step}.pt")
+            save_file(model.state_dict(), f"model_{step}.safetensors")
 
         if step == TOTAL_NUMBER_OF_STEPS:
             break
@@ -363,7 +364,8 @@ def main(local_rank, world_size):
     dist.destroy_process_group()
     
     if local_rank == 0:
-        torch.save(model.state_dict(), "model.pt")
+        save_file(model.state_dict(), "model.safetensors")
+        update_model_hf(os.path.abspath("model.safetensors"))
 
 if __name__ == "__main__":
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -371,4 +373,4 @@ if __name__ == "__main__":
     world_size = torch.cuda.device_count()
     mp.spawn(main, args=(world_size,), nprocs=world_size, join=True)
     plt.plot(losses)
-    plt.show()
+    plt.savefig("loss_fig.png")
