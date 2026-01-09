@@ -300,7 +300,7 @@ class DecoderLayer(nn.Module):
 
 class Model(nn.Module):
 
-    def __init__(self, config, device="cuda:0"):
+    def __init__(self, config, device="cpu"):
         super().__init__()
 
         self.config = config

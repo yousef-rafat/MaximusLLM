@@ -249,7 +249,8 @@ def main(local_rank, world_size):
     config.context_length = MAX_LENGTH
     
     # for muons stability, we init the model to fp32
-    model = Model(config, device).float()
+    model = Model(config, "cpu").float()
+    model.to(device)
     prefetch = CUDAPreFetch(dataset, device)
     prefetch.async_load()
     model.gradient_checkpointing = True
