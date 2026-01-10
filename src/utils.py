@@ -31,3 +31,10 @@ def update_model_hf(model_path, hf_dir="yousefg/MaximusLLM", token="", full_repl
             repo_id=hf_dir,
             token=token
         )
+
+def get_raw_model(model):
+    if hasattr(model, "module"):
+        model = model.module
+    if hasattr(model, "_orig_model"):
+        model = model._orig_model
+    return model.state_dict()

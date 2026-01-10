@@ -15,17 +15,17 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file, save_file
 from contextlib import nullcontext
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-from utils import update_model_hf
+from utils import update_model_hf, get_raw_model
 
 losses = []
-INDEX = 0
+INDEX = 1504
 TORCH_COMPILE = True
 LONG_CONTEXT_TRAINING = False
-MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 32768
+MAX_LENGTH = 4096 if not LONG_CONTEXT_TRAINING else 32768
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
 SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
-TOTAL_NUMBER_OF_STEPS = 100_000
+TOTAL_NUMBER_OF_STEPS = 1_984
 ACCUM_STEPS = 32
 PACKING = True
 WARMUP = (TOTAL_NUMBER_OF_STEPS * 0.05)
@@ -250,22 +250,14 @@ def main(local_rank, world_size):
     config.context_length = MAX_LENGTH
     
     # for muons stability, we init the model to fp32
-    model = Model(config, "cpu").float()
+    model = Model(config, device).float()
     model.to(device)
     prefetch = CUDAPreFetch(dataset, device)
     prefetch.async_load()
     model.gradient_checkpointing = True
     criterion = LigerFusedLinearCrossEntropyLoss()
 
-    model.train()
-    if TORCH_COMPILE:
-        model = model.to(device)
-        model = torch.compile(model, fullgraph = True, mode = "reduce-overhead")
-    else:
-        model = model.to(device)
-
-    model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank], find_unused_parameters=False)
-    param_groups = filter_ckpt_for_muon(model.module, Settings.weight_decay)
+    param_groups = filter_ckpt_for_muon(model, Settings.weight_decay)
     
     # Split the groups for each optimizer
     adamw_groups = [group for group in param_groups if group['params'][0].dim() < 2]
@@ -281,7 +273,7 @@ def main(local_rank, world_size):
     if os.path.exists("model.safetensors"):
         try:
             checkpoint = torch.load("model.safetensors")
-            model.module.load_state_dict(checkpoint, strict =  False)
+            model.load_state_dict(checkpoint, strict =  False)
         except Exception as e:
             print(e)
     else:
@@ -293,8 +285,17 @@ def main(local_rank, world_size):
             else:
                 new_key = key
             new_state_dict[new_key] = value
-        model.module.load_state_dict(new_state_dict, strict = False)
+        model.load_state_dict(new_state_dict, strict = False)
         del new_state_dict, checkpoint
+
+    model.train()
+    if TORCH_COMPILE:
+        model = model.to(device)
+        model = torch.compile(model, fullgraph = True, mode = "reduce-overhead")
+    else:
+        model = model.to(device)
+
+    model = torch.nn.parallel.DistributedDataParallel(model, output_device = local_rank, device_ids = [local_rank], find_unused_parameters=False)
 
     # quantization
     if QAT_TRAINING:
@@ -356,16 +357,20 @@ def main(local_rank, world_size):
         step += 1
 
         if step % SAVE_EVERY_STEP == 0 and local_rank == 0:
-            save_file(model.state_dict(), f"model_{step}.safetensors")
+            save_file(get_raw_model(model), f"model_{step}.safetensors")
 
         if step == TOTAL_NUMBER_OF_STEPS:
             break
-
-    dist.destroy_process_group()
+    
+    dist.barrier()
     
     if local_rank == 0:
-        save_file(model.state_dict(), "model.safetensors")
-        update_model_hf(os.path.abspath("model.safetensors"))
+        save_file(get_raw_model(model), "model.safetensors")
+        update_model_hf(os.path.abspath("model.safetensors"), token = "")
+        print("model saved")
+
+    dist.barrier()
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     os.environ["MASTER_ADDR"] = "127.0.0.1"
