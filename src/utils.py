@@ -1,5 +1,5 @@
 import torch
-from huggingface_hub import upload_file
+from huggingface_hub import upload_file, delete_file
 from safetensors.torch import save_file
 import tempfile
 import os
@@ -32,9 +32,16 @@ def update_model_hf(model_path, hf_dir="yousefg/MaximusLLM", token="", full_repl
             token=token
         )
 
+        if full_replace:
+            delete_file(
+                path_in_repo="model_test.safetensors",
+                repo_id = hf_dir,
+                token=token
+            )
+
 def get_raw_model(model):
     if hasattr(model, "module"):
         model = model.module
     if hasattr(model, "_orig_model"):
         model = model._orig_model
-    return model.state_dict()
+    return model
