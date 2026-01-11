@@ -2,6 +2,7 @@ import os
 import torch
 import random
 from model import Model, Config
+from itertools import islice
 import torch.distributed as dist
 from datasets import load_dataset
 import torch.multiprocessing as mp
@@ -17,7 +18,7 @@ from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 from utils import update_model_hf, get_raw_model
 
 losses = []
-INDEX = 3490
+INDEX = 3490 * torch.cuda.device_count()
 TORCH_COMPILE = True
 LONG_CONTEXT_TRAINING = False
 MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 32768
@@ -122,7 +123,8 @@ class HFStreamDataset(IterableDataset):
                 break
             except:
                 continue
-        self.dataset = dataset.skip(INDEX)
+        # TODO: better solution than islice (that doesn't send many HTTP requests)
+        self.dataset = islice(dataset, INDEX * Settings.batch_size, None)
         self.tokenizer = AutoTokenizer.from_pretrained("yousefg/MaximusLLM")
         self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
 
