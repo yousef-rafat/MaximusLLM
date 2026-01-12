@@ -1,4 +1,5 @@
 import copy
+import math
 import torch
 from typing import *
 import torch.nn as nn
@@ -74,13 +75,17 @@ def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
                       x2 * cos + x1 * sin], dim=-1)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, config, device):
+    def __init__(self, config: "Config", device):
         super().__init__()
         self.device = device
         self.head_dim = config.head_dim
         self.base = config.base
+
         self.initial_context_length = config.initial_context_length
+        self.fast_beta = config.fast_beta
+        self.slow_beta = config.slow_beta
         self.ntk_alpha = config.ntk_alpha
+        self.use_yarn = config.use_yarn
 
     # dynamic ntk
     def _compute_inv_freq_dynamic(self, seq_len: int):
@@ -91,8 +96,36 @@ class RotaryEmbedding(nn.Module):
         concentration = 1.0
         return concentration, inv_freq
 
+    # yarn
+    def _compute_inv_freq_yarn(self, seq_len, scale_factor=None):
+
+        if scale_factor is None:
+            scale_factor = max(1.0, seq_len / self.initial_context_length)
+
+        dim = self.head_dim
+        freqs = 1.0 / (self.base ** (torch.arange(0, dim, 2, device=self.device).float() / dim))
+        
+        wavelen = 2 * math.pi / freqs
+        
+        ramp = (wavelen - self.slow_beta) / (self.fast_beta - self.slow_beta)
+        ramp = torch.clamp(ramp, 0.0, 1.0)
+
+        inv_freq_interpolated = freqs / scale_factor 
+        inv_freq = (1 - ramp) * freqs + ramp * inv_freq_interpolated
+        
+        if scale_factor > 1.0:
+            mscale = 0.1 * math.log(scale_factor) + 1.0
+            concentration = mscale
+        else:
+            concentration = 1.0
+
+        return concentration, inv_freq
+
     def _compute_cos_sin(self, num_tokens):
-        concentration, inv_freq = self._compute_inv_freq_dynamic(num_tokens)
+        if self.config.use_yarn:
+            concentration, inv_freq = self._compute_inv_freq_yarn(num_tokens)
+        else:
+            concentration, inv_freq = self._compute_inv_freq_dynamic(num_tokens)
         t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         cos = freqs.cos() * concentration
@@ -407,4 +440,7 @@ class Config(Gemma3TextConfig):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.base = 10_000
         self.initial_context_length = 4096
+        self.fast_beta = 32
+        self.slow_beta = 1
+        self.use_yarn = False # for long context training only
         self.ntk_alpha = 1.0
