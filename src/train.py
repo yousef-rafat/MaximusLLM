@@ -286,6 +286,7 @@ def main(local_rank, world_size):
             else:
                 new_key = key
             new_state_dict[new_key] = value
+        new_state_dict["lm_head.weight"] = new_state_dict["embed_tokens.weight"]
         model.load_state_dict(new_state_dict, strict = False)
         del new_state_dict, checkpoint
 
