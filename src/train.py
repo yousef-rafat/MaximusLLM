@@ -109,6 +109,8 @@ def diagonal_attn_mask(seq, eos_token):
     causal_mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
     
     combined_mask = diff_doc_mask | causal_mask
+    ids = torch.arange(len(seq), device=seq.device)
+    combined_mask[ids, ids] = False 
     return combined_mask
 
 class HFStreamDataset(IterableDataset):
@@ -249,6 +251,7 @@ def main(local_rank, world_size):
 
     config.rope_theta = ROPE_THETA
     config.context_length = MAX_LENGTH
+    config.use_lora = LONG_CONTEXT_TRAINING
     
     # for muons stability, we init the model to fp32
     model = Model(config, device).float()

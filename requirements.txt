@@ -1,0 +1,7 @@
+torch>=2.90
+transformers
+huggingface_hub
+safetensors
+liger_kernel
+datasets
+matplotlib # optional
