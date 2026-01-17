@@ -324,6 +324,9 @@ def main(local_rank, world_size):
         with sync_context:
             with torch.amp.autocast(enabled = True, device_type = f"cuda:{local_rank}", dtype=dtype):
                 input_ids, attention_mask = inputs
+                if input_ids.max().item() > model.module.embed_tokens.weight.shape[0]:
+                    print("skipping batch")
+                    continue
                 logits = model(input_ids, attention_mask = attention_mask, return_hidden=True)
                 loss = criterion(
                     model.module.lm_head.weight, 
