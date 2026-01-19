@@ -367,6 +367,10 @@ def main(local_rank, world_size):
                 logits = model(
                     input_ids, attention_mask=attention_mask, return_hidden=True
                 )
+
+                logits = logits[:, :-1, :].reshape(-1, model.module.config.hidden_size)
+                input_ids = input_ids[:, 1:].reshape(-1)
+
                 loss = criterion(
                     model.module.lm_head.weight,
                     logits.view(-1, model.module.config.hidden_size),
