@@ -456,4 +456,3 @@ class Config(Gemma3TextConfig):
         self.slow_beta = 1
         self.use_yarn = False # for long context training only
         self.ntk_alpha = 1.0
-        self.vocab_size = 262144
