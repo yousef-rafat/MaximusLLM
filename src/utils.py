@@ -45,3 +45,13 @@ def get_raw_model(model):
     if hasattr(model, "_orig_mod"):
         model = model._orig_mod
     return model
+
+def clean_checkpoint(checkpoint):
+    new_checkpoint = {}
+    for k, v in checkpoint.items():
+        if k.startswith("module."):
+            k = k.replace("module.", "", 1)
+        if k.startswith("_orig_mod."):
+            k = k.replace("_orig_mod.", "", 1)
+        new_checkpoint[k] = v
+    return new_checkpoint

@@ -80,6 +80,7 @@ class RotaryEmbedding(nn.Module):
         self.device = device
         self.head_dim = config.head_dim
         self.base = config.base
+        self.config = config
 
         self.initial_context_length = config.initial_context_length
         self.fast_beta = config.fast_beta
@@ -136,7 +137,7 @@ class Attention(nn.Module):
 
     def __init__(self, config, layer_idx: int, device):
         super().__init__()
-        self.is_latent = not (layer_idx in [0, config.num_hidden_layers // 2, config.num_hidden_layers])
+        self.is_latent = layer_idx not in [0, config.num_hidden_layers // 2, config.num_hidden_layers]
         self.config = config
         self.layer_idx = layer_idx
 
@@ -256,14 +257,13 @@ class Attention(nn.Module):
             query_states = _apply_rotary_emb(query_states, cos, sin)
             key_states = _apply_rotary_emb(key_states, cos, sin)
 
+        if value_states.ndim == 3:
+            value_states = value_states.unsqueeze(2)
+        query_states, key_states, value_states = [t.transpose(1, 2) for t in (query_states, key_states, value_states)]
+
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        if value_states.ndim == 3:
-            value_states = value_states.unsqueeze(2)
-
-        query_states, key_states, value_states = [t.transpose(1, 2) for t in (query_states, key_states, value_states)]
 
         if attention_mask is not None:
             attention_mask = create_causal_padding_mask(
@@ -375,10 +375,10 @@ class Model(nn.Module):
         self,
         input_ids,
         attention_mask,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        past_key_values = None,
+        inputs_embeds = None,
+        use_cache = None,
+        cache_position = None,
         return_hidden = False,
         **kwargs,
     ):
@@ -399,11 +399,21 @@ class Model(nn.Module):
                 device=inputs_embeds.device,
             )
 
-        seq_len = input_ids.size(1)
+        if use_cache:
+            seq_len = cache_position.max().item() + 1
+        else:
+            seq_len = input_ids.size(1)
 
         # mix the global and local cos/sin 
         cos_g, sin_g = self.rotary_emb._compute_cos_sin(seq_len)
         cos_l, sin_l = self.rotary_emb_local._compute_cos_sin(seq_len)
+
+        # inference
+        if use_cache:
+            cos_g = cos_g[cache_position]
+            sin_g = sin_g[cache_position]
+            cos_l = cos_l[cache_position]
+            sin_l = sin_l[cache_position]
 
         positional_embeddings = (cos_g, sin_g, cos_l, sin_l)
 
@@ -429,6 +439,8 @@ class Model(nn.Module):
             return hidden_states
         logits = self.lm_head(hidden_states)
 
+        if use_cache:
+            return logits, past_key_values
         return logits
 
 # TODO: move to a json file
