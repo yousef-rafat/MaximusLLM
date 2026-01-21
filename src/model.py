@@ -1,9 +1,9 @@
 import copy
 import math
 import torch
-from typing import *
 import torch.nn as nn
-from transformers import DynamicCache, Cache, Gemma3TextConfig 
+from transformers import DynamicCache, Gemma3TextConfig, AutoModelForCausalLM
+from fisher_svd import svd_init_latent, compute_fisher_importance, model_id, token
 
 def create_causal_padding_mask(attention_mask, seq_len, dtype, device):
 
@@ -137,7 +137,7 @@ class Attention(nn.Module):
 
     def __init__(self, config, layer_idx: int, device):
         super().__init__()
-        self.is_latent = layer_idx not in [0, config.num_hidden_layers // 2, config.num_hidden_layers]
+        self.is_latent = layer_idx not in [5, 11, config.num_hidden_layers - 1]
         self.config = config
         self.layer_idx = layer_idx
 
@@ -292,14 +292,14 @@ class DecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states,
         attention_mask,
-        position_embeddings: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings,
+        position_ids= None,
+        past_key_values = None,
+        output_attentions= False,
+        use_cache = False,
+        cache_position= None,
         **kwargs,
     ):
 
@@ -359,17 +359,29 @@ class Model(nn.Module):
         self.lm_head.weight = self.embed_tokens.weight
         self.gradient_checkpointing = False
 
-        self.post_init()
-
-    def post_init(self):
-        std = 0.02
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                module.weight.data.normal_(mean=0.0, std=std)
-                if module.bias is not None:
-                    module.bias.data.zero_()
-            elif isinstance(module, nn.Embedding):
-                module.weight.data.normal_(mean=0.0, std=std)
+    def init_latent_attention(self, num_batches=100):
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, token=token, torch_dtype=torch.float32
+        )
+        fisher_vector = compute_fisher_importance(model, num_batches=num_batches)
+        for i, module in enumerate(self.layers.modules()):
+            if hasattr(module.self_attn, "q_a"):
+                q_checkpoint = model.layers[i].self_attn.q_proj
+                k_checkpoint = model.layers[i].self_attn.k_proj
+                v_checkpoint = model.layers[i].self_attn.v_proj
+                orig_norm_checkpoint = model.layers[i].self_attn.q_norm
+                k_orig_norm_checkpoint = model.layers[i].self_attn.k_norm
+                kv_checkpoint = torch.cat([k_checkpoint, v_checkpoint])
+                temp_layer = nn.Linear(kv_checkpoint.shape[1], kv_checkpoint.shape[0], bias=False)
+                temp_layer.weight.data = kv_checkpoint
+                svd_init_latent(
+                    module.self_attn.q_a, module.self_attn.q_b, orig_weights=q_checkpoint, rank=self.config.q_lora_rank,
+                    orig_norm=orig_norm_checkpoint, norm_layer=module.self_attn.q_norm_latent, fisher_vector = fisher_vector
+                )
+                svd_init_latent(
+                    module.self_attn.kv_a, module.self_attn.kv_b, orig_weights=temp_layer, rank=self.config.kv_lora_rank,
+                    orig_norm=k_orig_norm_checkpoint, norm_layer=module.self_attn.k_norm, fisher_vector = fisher_vector
+                )
 
     def forward(
         self,
@@ -447,8 +459,8 @@ class Model(nn.Module):
 class Config(Gemma3TextConfig):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.q_lora_rank = 32 # may increase
-        self.kv_lora_rank = 32
+        self.q_lora_rank = 128
+        self.kv_lora_rank = 64
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.base = 10_000
         self.initial_context_length = 4096
