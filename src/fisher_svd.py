@@ -23,7 +23,7 @@ def compute_fisher_importance(model, num_batches = 100):
     fisher_info = {}
     
     model.train()
-    device = next(model.parameters()).device
+    model.to(device)
     for i, batch in tqdm(enumerate(dataset), total=num_batches):
         if i >= num_batches: 
             break
@@ -71,9 +71,17 @@ def compute_fisher_importance(model, num_batches = 100):
 def svd_init_latent(layer_a, layer_b, orig_weights, rank, norm_layer, orig_norm, fisher_vector, debug_information = True):
 
     gemma = orig_norm.weight.data.float()#.repeat(num_heads)
+    W = orig_weights.weight.float()
 
-    W = orig_weights.weight * gemma.unsqueeze(0)
-    W = W * fisher_vector.unsqueeze(0)
+    num_repeats = W.size(0) // gemma.size(0) # num_heads
+    gemma = gemma.repeat(num_repeats)
+
+    W_fused = W * gemma.unsqueeze(1)
+    
+    f_max = fisher_vector.max()
+    fisher_scale = torch.clamp(fisher_vector / (f_max + 1e-8), min = 0.01).unsqueeze(0)
+
+    W = W_fused * fisher_scale
 
     U, S, V_h = torch.linalg.svd(W, full_matrices=False)
 
@@ -81,7 +89,7 @@ def svd_init_latent(layer_a, layer_b, orig_weights, rank, norm_layer, orig_norm,
     S_r = S[:rank]
     Vh_r = V_h[:rank, :]
 
-    Vh_r /= fisher_vector
+    Vh_r /= fisher_scale
 
     #scale
     S_sqrt = torch.diag(torch.sqrt(S_r))
@@ -97,6 +105,9 @@ def svd_init_latent(layer_a, layer_b, orig_weights, rank, norm_layer, orig_norm,
     # reconstruction error
     if debug_information:
         W_recon = torch.matmul(W_b, W_a)
-        diff = torch.norm(W - W_recon) / torch.norm(W)
-        print(f"Reconstruction Error: {diff}")
+        diff = torch.norm(W_fused - W_recon) / torch.norm(W_fused)
+        
+        w_err = torch.norm((W_fused - W_recon) * fisher_scale) / torch.norm(W_fused * fisher_scale)
+        
+        print(f"  Reconstruction Error: {diff:.4f} | Weighted Error: {w_err:.4f}")
 

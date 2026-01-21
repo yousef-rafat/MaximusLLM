@@ -364,23 +364,38 @@ class Model(nn.Module):
             model_id, token=token, torch_dtype=torch.float32
         )
         fisher_vector = compute_fisher_importance(model, num_batches=num_batches)
-        for i, module in enumerate(self.layers.modules()):
+        for i, module in enumerate(self.layers):
             if hasattr(module.self_attn, "q_a"):
-                q_checkpoint = model.self_attn.q_proj
-                k_checkpoint = model.self_attn.k_proj
-                v_checkpoint = model.self_attn.v_proj
-                orig_norm_checkpoint = model.self_attn.q_norm
-                k_orig_norm_checkpoint = model.self_attn.k_norm
-                kv_checkpoint = torch.cat([k_checkpoint, v_checkpoint])
+                fisher_vector_q = fisher_vector.get(f"model.layers.{i}.self_attn.q_proj")
+                fisher_vector_k = fisher_vector.get(f"model.layers.{i}.self_attn.k_proj")
+                fisher_vector_v = fisher_vector.get(f"model.layers.{i}.self_attn.v_proj")
+                fisher_vector_kv = fisher_vector_k + fisher_vector_v
+
+                q_checkpoint = model.model.layers[i].self_attn.q_proj
+                k_checkpoint = model.model.layers[i].self_attn.k_proj
+                v_checkpoint = model.model.layers[i].self_attn.v_proj
+                orig_norm_checkpoint = model.model.layers[i].self_attn.q_norm
+                k_orig_norm_checkpoint = model.model.layers[i].self_attn.k_norm.weight.data
+
+                k_layer_w = k_checkpoint.weight.data
+                num_repeats = k_layer_w.size(0) // k_orig_norm_checkpoint.size(0) # num_heads
+                k_w_checkpoint = k_layer_w * k_orig_norm_checkpoint.repeat(num_repeats).unsqueeze(1)
+
+                kv_checkpoint = torch.cat([k_w_checkpoint, v_checkpoint.weight.data.float()])
                 temp_layer = nn.Linear(kv_checkpoint.shape[1], kv_checkpoint.shape[0], bias=False)
                 temp_layer.weight.data = kv_checkpoint
+
+                temp_identity_norm = type('', (), {})()
+                temp_identity_norm.weight = type('', (), {})() 
+                temp_identity_norm.weight.data = torch.ones(1, device=k_layer_w.device)
+
                 svd_init_latent(
                     module.self_attn.q_a, module.self_attn.q_b, orig_weights=q_checkpoint, rank=self.config.q_lora_rank,
-                    orig_norm=orig_norm_checkpoint, norm_layer=module.self_attn.q_norm_latent, fisher_vector = fisher_vector
+                    orig_norm=orig_norm_checkpoint, norm_layer=module.self_attn.q_norm_latent, fisher_vector=fisher_vector_q
                 )
                 svd_init_latent(
                     module.self_attn.kv_a, module.self_attn.kv_b, orig_weights=temp_layer, rank=self.config.kv_lora_rank,
-                    orig_norm=k_orig_norm_checkpoint, norm_layer=module.self_attn.k_norm, fisher_vector = fisher_vector
+                    orig_norm=temp_identity_norm, norm_layer=module.self_attn.kv_norm, fisher_vector=fisher_vector_kv
                 )
 
     def forward(
