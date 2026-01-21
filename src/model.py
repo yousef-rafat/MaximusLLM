@@ -366,11 +366,11 @@ class Model(nn.Module):
         fisher_vector = compute_fisher_importance(model, num_batches=num_batches)
         for i, module in enumerate(self.layers.modules()):
             if hasattr(module.self_attn, "q_a"):
-                q_checkpoint = model.layers[i].self_attn.q_proj
-                k_checkpoint = model.layers[i].self_attn.k_proj
-                v_checkpoint = model.layers[i].self_attn.v_proj
-                orig_norm_checkpoint = model.layers[i].self_attn.q_norm
-                k_orig_norm_checkpoint = model.layers[i].self_attn.k_norm
+                q_checkpoint = model.self_attn.q_proj
+                k_checkpoint = model.self_attn.k_proj
+                v_checkpoint = model.self_attn.v_proj
+                orig_norm_checkpoint = model.self_attn.q_norm
+                k_orig_norm_checkpoint = model.self_attn.k_norm
                 kv_checkpoint = torch.cat([k_checkpoint, v_checkpoint])
                 temp_layer = nn.Linear(kv_checkpoint.shape[1], kv_checkpoint.shape[0], bias=False)
                 temp_layer.weight.data = kv_checkpoint

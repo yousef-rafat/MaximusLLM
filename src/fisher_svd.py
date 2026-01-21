@@ -4,12 +4,12 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 from datasets import load_dataset
 
-token = ""
+token = "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"
 model_id = "google/gemma-3-270m"
 
 NUM_CALIBRATION_BATCHES = 16 
 BATCH_SIZE = 4
-SEQ_LEN = 1024
+SEQ_LEN = 512
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # get the importance of the parameters and how they affect the input and gradients
@@ -23,6 +23,7 @@ def compute_fisher_importance(model, num_batches = 100):
     fisher_info = {}
     
     model.train()
+    device = next(model.parameters()).device
     for i, batch in tqdm(enumerate(dataset), total=num_batches):
         if i >= num_batches: 
             break
@@ -34,8 +35,15 @@ def compute_fisher_importance(model, num_batches = 100):
         inputs = tokenizer(text, return_tensors="pt", max_length=SEQ_LEN, truncation=True)
         input_ids = inputs["input_ids"].to(device)
         
-        outputs = model(input_ids, labels=input_ids)
-        loss = outputs.loss
+        logits = model(input_ids.to(device), attention_mask = torch.ones_like(input_ids), output_hidden_states=True).logits
+        if logits.ndim != 3:
+            logits = logits.unsqueeze(0)
+        if input_ids.ndim != 2:
+            input_ids = input_ids.unsqueeze(0)
+        logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+        input_ids = input_ids[:, 1:].reshape(-1)
+
+        loss = torch.nn.functional.cross_entropy(logits, input_ids)
         
         model.zero_grad()
         loss.backward()
