@@ -25,10 +25,10 @@ MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 32768
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
 SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
-TOTAL_NUMBER_OF_STEPS = 1_984
 ACCUM_STEPS = 32
+TOTAL_NUMBER_OF_STEPS = 1_984 // ACCUM_STEPS
 PACKING = True
-WARMUP = TOTAL_NUMBER_OF_STEPS * 0.05
+WARMUP = max(30, TOTAL_NUMBER_OF_STEPS * 0.05) # stability
 DECAY = TOTAL_NUMBER_OF_STEPS * 0.1
 STABLE = TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY)
 
@@ -47,9 +47,9 @@ def lr_scheduler_fn(optimizer, min_lr=0.1):
 
 
 class Settings:
-    weight_decay = 0.1
+    weight_decay = 0.01
     batch_size = 8
-    muon_lr = 0.01
+    muon_lr = 0.005
     adamw_rate = 5e-4
 
 
