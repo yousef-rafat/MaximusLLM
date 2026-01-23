@@ -474,7 +474,7 @@ class Model(nn.Module):
     @torch.no_grad()
     def balance_svd_layers(self):
         # force latent attn layers A and B to have same mag.
-        # mathmathically identicial
+        # mathematically identicial
         for module in self.modules():
             if hasattr(module, "q_a") and hasattr(module, "q_b"):
                 norm_a = module.q_a.norm()
