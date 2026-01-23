@@ -470,6 +470,36 @@ class Model(nn.Module):
             return logits, past_key_values
         return logits
 
+    # step hook
+    @torch.no_grad()
+    def balance_svd_layers(self):
+        # force latent attn layers A and B to have same mag.
+        # mathmathically identicial
+        for module in self.modules():
+            if hasattr(module, "q_a") and hasattr(module, "q_b"):
+                norm_a = module.q_a.norm()
+                norm_b = module.q_b.norm()
+
+                geometeric_mean = torch.sqrt(norm_a * norm_b)
+
+                scale_a = geometeric_mean / (norm_a + 1e-6)
+                scale_b = geometeric_mean / (norm_b + 1e-6)
+
+                module.q_a.weight.mul_(scale_a)
+                module.q_b.weight.mul_(scale_b)
+
+            if hasattr(module, "kv_a") and hasattr(module, "kv_b"):
+                norm_a = module.kv_a.norm()
+                norm_b = module.kv_b.norm()
+
+                geometeric_mean = torch.sqrt(norm_a * norm_b)
+
+                scale_a = geometeric_mean / (norm_a + 1e-6)
+                scale_b = geometeric_mean / (norm_b + 1e-6)
+
+                module.kv_a.weight.mul_(scale_a)
+                module.kv_b.weight.mul_(scale_b)
+
 # TODO: move to a json file
 class Config(Gemma3TextConfig):
     def __init__(self, *args, **kwargs):

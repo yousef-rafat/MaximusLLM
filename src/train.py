@@ -32,6 +32,9 @@ WARMUP = max(30, TOTAL_NUMBER_OF_STEPS * 0.05) # stability
 DECAY = TOTAL_NUMBER_OF_STEPS * 0.1
 STABLE = TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY)
 
+# hook: frequency_in_steps
+TRAINING_HOOKS = {"balance_svd_layers": 10}
+
 
 def lr_scheduler_fn(optimizer, min_lr=0.1):
     def scheduler(current_step):
@@ -51,6 +54,7 @@ class Settings:
     batch_size = 8
     muon_lr = 0.005
     adamw_rate = 5e-4
+    use_adamw_only = True
 
 
 class CUDAPreFetch:
@@ -288,12 +292,17 @@ def main(local_rank, world_size):
     adamw_groups = [group for group in param_groups if group["params"][0].dim() < 2]
     muon_groups = [group for group in param_groups if group["params"][0].dim() >= 2]
 
-    main_optimizer = torch.optim.Muon(muon_groups, lr=Settings.muon_lr)
+    if not Settings.use_adamw_only:
+        main_optimizer = torch.optim.Muon(muon_groups, lr=Settings.muon_lr)
+        muon_scheduler = lr_scheduler_fn(main_optimizer)
+    else:
+        adamw_groups += muon_groups
+
     second_optimizer = torch.optim.AdamW(adamw_groups, lr=Settings.adamw_rate)
+    adam_scheduler = lr_scheduler_fn(second_optimizer)
+
     scaler = torch.amp.GradScaler(enabled=False)
 
-    muon_scheduler = lr_scheduler_fn(main_optimizer)
-    adam_scheduler = lr_scheduler_fn(second_optimizer)
 
     if os.path.exists("model.safetensors"):
         try:
@@ -382,19 +391,22 @@ def main(local_rank, world_size):
             scaler.scale(loss).backward()
 
         if (step + 1) % ACCUM_STEPS == 0:
-            scaler.unscale_(main_optimizer)
+            if not Settings.use_adamw_only:
+                scaler.unscale_(main_optimizer)
             scaler.unscale_(second_optimizer)
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            scaler.step(main_optimizer)
+            if not Settings.use_adamw_only:
+                scaler.step(main_optimizer)
             scaler.step(second_optimizer)
             scaler.update()
 
-            main_optimizer.zero_grad(set_to_none=True)
-            second_optimizer.zero_grad(set_to_none=True)
+            if not Settings.use_adamw_only:
+                main_optimizer.zero_grad(set_to_none=True)
+                muon_scheduler.step()
 
-            muon_scheduler.step()
+            second_optimizer.zero_grad(set_to_none=True)
             adam_scheduler.step()
 
             if local_rank == 0 and ((step + 1) // ACCUM_STEPS) % 10 == 0:
@@ -402,6 +414,13 @@ def main(local_rank, world_size):
                     f"step {(step // ACCUM_STEPS):05d} | loss {(loss.item() * ACCUM_STEPS):.4f}"
                 )
                 losses.append(loss.detach().cpu())
+            
+            for k, v in TRAINING_HOOKS.items():
+                if hasattr(model, k):
+                    div_steps = v
+                    attr = getattr(model, k)
+                    if (((step + 1) // ACCUM_STEPS) % div_steps) == 0:
+                        attr(model)
 
         del input_ids, attention_mask, logits, loss
 
@@ -411,7 +430,7 @@ def main(local_rank, world_size):
         if step % SAVE_EVERY_STEP == 0 and local_rank == 0:
             save_model(get_raw_model(model), f"model_{step}.safetensors")
 
-        if step == TOTAL_NUMBER_OF_STEPS:
+        if step == (TOTAL_NUMBER_OF_STEPS * ACCUM_STEPS):
             break
 
     dist.barrier()
