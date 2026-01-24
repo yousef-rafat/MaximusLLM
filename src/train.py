@@ -17,6 +17,9 @@ from contextlib import nullcontext
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 from utils import update_model_hf, get_raw_model
 
+from transformers.utils import logging
+logging.set_verbosity_error()
+
 losses = []
 INDEX = 3490 * torch.cuda.device_count()
 TORCH_COMPILE = True
@@ -53,7 +56,7 @@ class Settings:
     weight_decay = 0.01
     batch_size = 8
     muon_lr = 0.005
-    adamw_rate = 5e-4
+    adamw_rate = 4e-4
     use_adamw_only = True
 
 
