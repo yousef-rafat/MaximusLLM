@@ -477,8 +477,8 @@ class Model(nn.Module):
         # mathematically identicial
         for module in self.modules():
             if hasattr(module, "q_a") and hasattr(module, "q_b"):
-                norm_a = module.q_a.norm()
-                norm_b = module.q_b.norm()
+                norm_a = module.q_a.weight.norm()
+                norm_b = module.q_b.weight.norm()
 
                 geometeric_mean = torch.sqrt(norm_a * norm_b)
 
@@ -489,8 +489,8 @@ class Model(nn.Module):
                 module.q_b.weight.mul_(scale_b)
 
             if hasattr(module, "kv_a") and hasattr(module, "kv_b"):
-                norm_a = module.kv_a.norm()
-                norm_b = module.kv_b.norm()
+                norm_a = module.kv_a.weight.norm()
+                norm_b = module.kv_b.weight.norm()
 
                 geometeric_mean = torch.sqrt(norm_a * norm_b)
 

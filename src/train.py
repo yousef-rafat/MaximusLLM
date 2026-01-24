@@ -304,7 +304,7 @@ def main(local_rank, world_size):
     second_optimizer = torch.optim.AdamW(adamw_groups, lr=Settings.adamw_rate)
     adam_scheduler = lr_scheduler_fn(second_optimizer)
 
-    scaler = torch.amp.GradScaler(enabled=False)
+    scaler = torch.amp.GradScaler(enabled=True)
 
 
     if os.path.exists("model.safetensors"):
@@ -419,11 +419,11 @@ def main(local_rank, world_size):
                 losses.append(loss.detach().cpu())
             
             for k, v in TRAINING_HOOKS.items():
-                if hasattr(model, k):
+                if hasattr(model.module, k):
                     div_steps = v
-                    attr = getattr(model, k)
+                    attr = getattr(model.module, k)
                     if (((step + 1) // ACCUM_STEPS) % div_steps) == 0:
-                        attr(model)
+                        attr()
 
         del input_ids, attention_mask, logits, loss
 
