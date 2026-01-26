@@ -36,7 +36,7 @@ DECAY = TOTAL_NUMBER_OF_STEPS * 0.1
 STABLE = TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY)
 
 # hook: frequency_in_steps
-TRAINING_HOOKS = {"balance_svd_layers": 10}
+TRAINING_HOOKS = {"balance_svd_layers": 1}
 
 
 def lr_scheduler_fn(optimizer, min_lr=0.1):
@@ -53,7 +53,7 @@ def lr_scheduler_fn(optimizer, min_lr=0.1):
 
 
 class Settings:
-    weight_decay = 0.01
+    weight_decay = 0.0
     batch_size = 8
     muon_lr = 0.005
     adamw_rate = 4e-4
@@ -400,6 +400,13 @@ def main(local_rank, world_size):
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
+            for k, v in TRAINING_HOOKS.items():
+                if hasattr(model.module, k):
+                    div_steps = v
+                    attr = getattr(model.module, k)
+                    if (((step + 1) // ACCUM_STEPS) % div_steps) == 0:
+                        attr()
+
             if not Settings.use_adamw_only:
                 scaler.step(main_optimizer)
             scaler.step(second_optimizer)
@@ -418,12 +425,6 @@ def main(local_rank, world_size):
                 )
                 losses.append(loss.detach().cpu())
             
-            for k, v in TRAINING_HOOKS.items():
-                if hasattr(model.module, k):
-                    div_steps = v
-                    attr = getattr(model.module, k)
-                    if (((step + 1) // ACCUM_STEPS) % div_steps) == 0:
-                        attr()
 
         del input_ids, attention_mask, logits, loss
 

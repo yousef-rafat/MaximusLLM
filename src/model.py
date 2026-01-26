@@ -187,11 +187,12 @@ class Attention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias, device=device
         )
 
+        # init logits as identity
         if self.is_latent:
             # start with strong RoPE bias
-            self.nope_logit = nn.Parameter(torch.tensor(-3.0))
+            self.nope_logit = nn.Parameter(torch.tensor(-5.0))
 
-        rope_logit = 0.5 # start with equal local and global rope
+        rope_logit = 0.01
         logit = torch.log(torch.tensor(rope_logit) / (1.0 - torch.tensor(rope_logit)))
         self.rope_global_local_logit = nn.Parameter(logit)
 
@@ -477,28 +478,32 @@ class Model(nn.Module):
         # mathematically identicial
         for module in self.modules():
             if hasattr(module, "q_a") and hasattr(module, "q_b"):
-                norm_a = module.q_a.weight.norm()
-                norm_b = module.q_b.weight.norm()
+                if module.q_a.weight.grad is not None and module.q_b.weight.grad is not None:
 
-                geometeric_mean = torch.sqrt(norm_a * norm_b)
+                    norm_a = module.q_a.weight.grad.norm()
+                    norm_b = module.q_b.weight.grad.norm()
 
-                scale_a = geometeric_mean / (norm_a + 1e-6)
-                scale_b = geometeric_mean / (norm_b + 1e-6)
+                    geometeric_mean = torch.sqrt(norm_a * norm_b)
 
-                module.q_a.weight.mul_(scale_a)
-                module.q_b.weight.mul_(scale_b)
+                    scale_a = geometeric_mean / (norm_a + 1e-6)
+                    scale_b = geometeric_mean / (norm_b + 1e-6)
+
+                    module.q_a.weight.grad.mul_(scale_a)
+                    module.q_b.weight.grad.mul_(scale_b)
 
             if hasattr(module, "kv_a") and hasattr(module, "kv_b"):
-                norm_a = module.kv_a.weight.norm()
-                norm_b = module.kv_b.weight.norm()
+                if module.kv_a.weight.grad is not None and module.kv_b.weight.grad is not None:
 
-                geometeric_mean = torch.sqrt(norm_a * norm_b)
+                    norm_a = module.kv_a.weight.grad.norm()
+                    norm_b = module.kv_b.weight.grad.norm()
 
-                scale_a = geometeric_mean / (norm_a + 1e-6)
-                scale_b = geometeric_mean / (norm_b + 1e-6)
+                    geometeric_mean = torch.sqrt(norm_a * norm_b)
 
-                module.kv_a.weight.mul_(scale_a)
-                module.kv_b.weight.mul_(scale_b)
+                    scale_a = geometeric_mean / (norm_a + 1e-6)
+                    scale_b = geometeric_mean / (norm_b + 1e-6)
+
+                    module.kv_a.weight.grad.mul_(scale_a)
+                    module.kv_b.weight.grad.mul_(scale_b)
 
 # TODO: move to a json file
 class Config(Gemma3TextConfig):
@@ -513,3 +518,4 @@ class Config(Gemma3TextConfig):
         self.slow_beta = 1
         self.use_yarn = False # for long context training only
         self.ntk_alpha = 1.0
+        self.vocab_size = 262144
