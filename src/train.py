@@ -53,11 +53,11 @@ def lr_scheduler_fn(optimizer, min_lr=0.1):
 
 
 class Settings:
-    weight_decay = 0.0
+    weight_decay = 0.05
     batch_size = 8
-    muon_lr = 0.005
+    muon_lr = 0.002
     adamw_rate = 4e-4
-    use_adamw_only = True
+    use_adamw_only = False
 
 
 class CUDAPreFetch:
@@ -328,7 +328,6 @@ def main(local_rank, world_size):
             else:
                 new_key = key
             new_state_dict[new_key] = value
-        new_state_dict["lm_head.weight"] = new_state_dict["embed_tokens.weight"]
         model.load_state_dict(new_state_dict, strict=False)
         del new_state_dict, checkpoint
 
@@ -398,14 +397,15 @@ def main(local_rank, world_size):
                 scaler.unscale_(main_optimizer)
             scaler.unscale_(second_optimizer)
 
+            #for k, v in TRAINING_HOOKS.items():
+            #    if hasattr(model.module, k):
+            #        div_steps = v
+            #        attr = getattr(model.module, k)
+            #        if (((step + 1) // ACCUM_STEPS) % div_steps) == 0:
+            #            attr()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            for k, v in TRAINING_HOOKS.items():
-                if hasattr(model.module, k):
-                    div_steps = v
-                    attr = getattr(model.module, k)
-                    if (((step + 1) // ACCUM_STEPS) % div_steps) == 0:
-                        attr()
 
             if not Settings.use_adamw_only:
                 scaler.step(main_optimizer)
