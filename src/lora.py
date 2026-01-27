@@ -62,6 +62,9 @@ def blockswap(model, rank, alpha, num_heads, head_dim):
         if hasattr(attn, "q_a"):
             layer.self_attn.q_a = ElongatingLoRALayer(layer.self_attn.q_a, *args)
             layer.self_attn.q_b = ElongatingLoRALayer(layer.self_attn.q_b, *args)
-        # TODO: kv_a and kv_b
+        
+        if hasattr(attn, "kv_a"):
+            layer.self_attn.kv_a = NormalLora(layer.self_attn.kv_a, *args)
+            layer.self_attn.kv_b = NormalLora(layer.self_attn.kv_b, *args)
     
         layer.self_attn.o_proj = NormalLora(layer.self_attn.o_proj, *args)

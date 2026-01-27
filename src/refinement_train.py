@@ -1,6 +1,6 @@
 # refine the fisher-svd init to align with the teacher model (distil)
 # we only train the head and its norm with an aggressive lr
-# made loss from 7.5-8 -> 5.8-6
+# made loss from 7.5-8 -> 5.8-6 (300 steps)
 
 import torch
 import torch.nn as nn
