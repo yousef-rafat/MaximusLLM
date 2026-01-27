@@ -397,12 +397,14 @@ def main(local_rank, world_size):
                 scaler.unscale_(main_optimizer)
             scaler.unscale_(second_optimizer)
 
-            #for k, v in TRAINING_HOOKS.items():
-            #    if hasattr(model.module, k):
-            #        div_steps = v
-            #        attr = getattr(model.module, k)
-            #        if (((step + 1) // ACCUM_STEPS) % div_steps) == 0:
-            #            attr()
+            for k, v in TRAINING_HOOKS.items():
+                if hasattr(model.module, k):
+                    div_steps = v
+                    if div_steps == 0:
+                        continue
+                    attr = getattr(model.module, k)
+                    if (((step + 1) // ACCUM_STEPS) % div_steps) == 0:
+                        attr()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 

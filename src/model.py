@@ -478,32 +478,32 @@ class Model(nn.Module):
         # mathematically identicial
         for module in self.modules():
             if hasattr(module, "q_a") and hasattr(module, "q_b"):
-                if module.q_a.weight.grad is not None and module.q_b.weight.grad is not None:
+                if module.q_a.weight is not None and module.q_b.weight is not None:
 
-                    norm_a = module.q_a.weight.grad.norm()
-                    norm_b = module.q_b.weight.grad.norm()
+                    norm_a = module.q_a.weight.norm()
+                    norm_b = module.q_b.weight.norm()
 
                     geometeric_mean = torch.sqrt(norm_a * norm_b)
 
                     scale_a = geometeric_mean / (norm_a + 1e-6)
                     scale_b = geometeric_mean / (norm_b + 1e-6)
 
-                    module.q_a.weight.grad.mul_(scale_a)
-                    module.q_b.weight.grad.mul_(scale_b)
+                    module.q_a.weight.mul_(scale_a)
+                    module.q_b.weight.mul_(scale_b)
 
             if hasattr(module, "kv_a") and hasattr(module, "kv_b"):
-                if module.kv_a.weight.grad is not None and module.kv_b.weight.grad is not None:
+                if module.kv_a.weight is not None and module.kv_b.weight is not None:
 
-                    norm_a = module.kv_a.weight.grad.norm()
-                    norm_b = module.kv_b.weight.grad.norm()
+                    norm_a = module.kv_a.weight.norm()
+                    norm_b = module.kv_b.weight.norm()
 
                     geometeric_mean = torch.sqrt(norm_a * norm_b)
 
                     scale_a = geometeric_mean / (norm_a + 1e-6)
                     scale_b = geometeric_mean / (norm_b + 1e-6)
 
-                    module.kv_a.weight.grad.mul_(scale_a)
-                    module.kv_b.weight.grad.mul_(scale_b)
+                    module.kv_a.weight.mul_(scale_a)
+                    module.kv_b.weight.mul_(scale_b)
 
 # TODO: move to a json file
 class Config(Gemma3TextConfig):
