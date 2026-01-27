@@ -14,15 +14,22 @@ from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file, save_model
 from contextlib import nullcontext
-from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 from utils import update_model_hf, get_raw_model
+from torch.utils.data import get_worker_info
+import torch.nn.functional as F
 
 from transformers.utils import logging
 logging.set_verbosity_error()
 
+try: 
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+except Exception:
+    pass
+
 losses = []
 INDEX = 3490 * torch.cuda.device_count()
 TORCH_COMPILE = True
+USE_FAST_SOFTMAX = True
 LONG_CONTEXT_TRAINING = False
 MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 32768
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
@@ -128,32 +135,55 @@ def diagonal_attn_mask(seq, eos_token):
 class HFStreamDataset(IterableDataset):
     def __init__(
         self,
-        dataset: str = "HuggingFaceFW/fineweb",
+        dataset_name: str = "HuggingFaceFW/fineweb",
         take=None,
         rank=0,
         world_size=1,
         max_retries=5,
     ):
+        self.dataset_name = dataset_name
+        self.take = take
         self.rank = rank
         self.world_size = world_size
+        self.max_retries = max_retries
 
-        for _ in range(0, max_retries):
+        self.skip_n = INDEX * Settings.batch_size
+
+        self.tokenizer = AutoTokenizer.from_pretrained("yousefg/MaximusLLM")
+        self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
+
+    def __iter__(self):
+        
+        worker_info = get_worker_info()
+        if worker_info is None:
+            num_workers = 1
+            worker_id = 0
+        else:
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+
+        global_num_workers = self.world_size * num_workers
+        global_worker_id = (self.rank * num_workers) + worker_id
+
+        dataset_stream = None
+        for _ in range(self.max_retries):
             try:
-                dataset = load_dataset(
-                    dataset, name="CC-MAIN-2024-10", split="train", streaming=True
+                dataset_stream = load_dataset(
+                    self.dataset_name, 
+                    name="CC-MAIN-2024-10", 
+                    split="train", 
+                    streaming=True
                 )
                 break
             except:  # noqa: E722
                 continue
-        # TODO: better solution than islice (that doesn't send many HTTP requests)
-        self.dataset = islice(dataset, INDEX * Settings.batch_size, None)
-        self.tokenizer = AutoTokenizer.from_pretrained("yousefg/MaximusLLM")
-        self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
 
-        if take is not None:
-            self.dataset = self.dataset.take(take)
+        if self.skip_n > 0:
+            dataset_stream = islice(dataset_stream, self.skip_n, None)
+            
+        if self.take is not None:
+            dataset_stream = dataset_stream.take(self.take)
 
-    def __iter__(self, batch_size=Settings.batch_size):
         buffer = []
         batch = []
         attention_masks = []
@@ -161,18 +191,19 @@ class HFStreamDataset(IterableDataset):
         def return_batch(batch, attention_masks=None):
             if LONG_CONTEXT_TRAINING or PACKING:
                 if isinstance(batch, list):
-                    batch = torch.stack(batch)
+                    b = torch.stack(batch)
                 else:
-                    batch = torch.tensor(batch, dtype=torch.long)
-                yield batch, torch.ones_like(batch)
+                    b = torch.tensor(batch, dtype=torch.long)
+                yield b, torch.ones_like(b)
             else:
                 yield (
                     pad_sequence(batch, batch_first=True),
                     pad_sequence(attention_masks, batch_first=True, padding_value=0),
                 )
 
-        for i, item in enumerate(self.dataset):
-            if i % self.world_size != self.rank:
+        for i, item in enumerate(dataset_stream):
+
+            if i % global_num_workers != global_worker_id:
                 continue
 
             tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
@@ -186,24 +217,20 @@ class HFStreamDataset(IterableDataset):
                     buffer = buffer[MAX_LENGTH:]
                     batch.append(torch.tensor(seq, dtype=torch.long))
 
-                    if len(batch) == batch_size:
+                    if len(batch) == Settings.batch_size:
                         yield from return_batch(batch)
                         batch = []
-            # TODO: should mix long, short, and medium sequence lengths
+            
             elif LONG_CONTEXT_TRAINING:
-                # random start if longer than MAX_LENGTH
                 if len(tokens) > MAX_LENGTH:
                     start = random.randint(0, len(tokens) - (MAX_LENGTH - 1))
                     tokens = tokens[start : start + (MAX_LENGTH - 1)]
                     seq = tokens + [self.eos_token]
                     batch.append(seq)
                 else:
-                    # accumulate tokens in a buffer
                     buffer.extend(tokens)
-
                     if buffer:
                         buffer.append(self.eos_token)
-
                     while len(buffer) >= MAX_LENGTH:
                         seq = buffer[:MAX_LENGTH]
                         buffer = buffer[MAX_LENGTH:]
@@ -214,18 +241,14 @@ class HFStreamDataset(IterableDataset):
                 batch.append(torch.tensor(tokens))
                 attention_masks.append(torch.ones(len(tokens)))
 
-            # yield full batches
-            if len(batch) == batch_size:
+            if len(batch) == Settings.batch_size:
                 yield from return_batch(batch, attention_masks)
                 batch = []
                 attention_masks = []
 
-        # remaining tokens
         if buffer and not PACKING:
             batch.append(buffer[:MAX_LENGTH])
-        elif (
-            PACKING and buffer
-        ):  # having consistent shapes -> better memory usuage with torch.compile
+        elif PACKING and buffer:
             seq = torch.tensor(buffer, dtype=torch.long)
             pad_len = MAX_LENGTH - len(seq)
             if pad_len > 0:
@@ -233,20 +256,53 @@ class HFStreamDataset(IterableDataset):
                 seq = torch.nn.functional.pad(
                     seq, (0, pad_len), value=self.tokenizer.pad_token_id or 0
                 )
-
                 batch.append(seq)
                 attention_masks = [mask]
             else:
                 batch.append(seq)
                 attention_masks = []
 
-        # last partial batch
         if batch:
             if PACKING and attention_masks:
                 while len(attention_masks) < len(batch):
                     attention_masks.insert(0, torch.ones(MAX_LENGTH))
             yield from return_batch(batch, attention_masks)
 
+# take target embeddings + random embeddings to compute the softmax
+# instead of expensive softmax over 260k vocab size
+def fast_sampled_softmax_loss(hidden_states, target_ids, embedding_weight, n_negatives=4096):
+    batch_size, hidden_dim = hidden_states.shape
+    vocab_size = embedding_weight.shape[0]
+
+    scale = torch.sqrt(torch.tensor(hidden_dim, dtype=torch.float32, device=hidden_states.device))
+    
+    target_embeddings = F.embedding(target_ids, embedding_weight)
+    
+    true_logits = (hidden_states * target_embeddings).sum(dim=1, keepdim=True) / scale
+
+    random_neg_ids = torch.randint(0, vocab_size, (n_negatives,), device=hidden_states.device)
+    random_neg_vectors = F.embedding(random_neg_ids, embedding_weight)
+    
+    random_neg_logits = torch.matmul(hidden_states, random_neg_vectors.t()) / scale
+    collision_mask = target_ids.unsqueeze(1) == random_neg_ids.unsqueeze(0)
+    random_neg_logits = random_neg_logits.masked_fill(collision_mask, float('-inf'))
+
+    num_batch_neg = min(2048, batch_size)
+    batch_neg_indices = torch.randperm(batch_size, device=hidden_states.device)[:num_batch_neg]
+    batch_neg_vectors = target_embeddings[batch_neg_indices]
+    
+    batch_neg_indices = target_ids[batch_neg_indices]
+    batch_neg_logits = torch.matmul(hidden_states, batch_neg_vectors.t()) / scale
+
+    collision_mask = target_ids.unsqueeze(1) == batch_neg_indices.unsqueeze(0)
+    batch_neg_logits = batch_neg_logits.masked_fill(collision_mask, float("-inf"))
+
+    all_logits = torch.cat([true_logits, random_neg_logits, batch_neg_logits], dim=1)
+
+    # index 0 == target
+    pseudo_labels = torch.zeros(batch_size, dtype=torch.long, device=hidden_states.device)
+    
+    return F.cross_entropy(all_logits, pseudo_labels)
 
 def perplexity(loss):
     nll_loss = loss.mean()
@@ -284,10 +340,15 @@ def main(local_rank, world_size):
     # for muons stability, we init the model to fp32
     model = Model(config, device).float()
     model.to(device)
+    dataset = torch.utils.data.DataLoader(
+        dataset, num_workers = 4, prefetch_factor = 2, batch_size=None, pin_memory = True
+    )
+
     prefetch = CUDAPreFetch(dataset, device)
     prefetch.async_load()
     model.gradient_checkpointing = True
-    criterion = LigerFusedLinearCrossEntropyLoss()
+    if not USE_FAST_SOFTMAX:
+        criterion = LigerFusedLinearCrossEntropyLoss()
 
     param_groups = filter_ckpt_for_muon(model, Settings.weight_decay)
 
@@ -380,13 +441,16 @@ def main(local_rank, world_size):
                 )
 
                 logits = logits[:, :-1, :].reshape(-1, model.module.config.hidden_size)
-                input_ids = input_ids[:, 1:].reshape(-1)
+                input_ids = input_ids[:, 1:].long().reshape(-1)
 
-                loss = criterion(
-                    model.module.lm_head.weight,
-                    logits.view(-1, model.module.config.hidden_size),
-                    input_ids.long().reshape(-1),
-                )
+                if USE_FAST_SOFTMAX:
+                    loss = fast_sampled_softmax_loss(logits, input_ids, model.module.lm_head.weight)
+                else:
+                    loss = criterion(
+                        model.module.lm_head.weight,
+                        logits,
+                        input_ids,
+                    )
 
                 loss = loss / ACCUM_STEPS
 
@@ -443,7 +507,7 @@ def main(local_rank, world_size):
 
     if local_rank == 0:
         save_model(get_raw_model(model), "model.safetensors")
-        update_model_hf(os.path.abspath("model.safetensors"), token="")
+        update_model_hf(os.path.abspath("model.safetensors"))
         print("model saved")
 
     dist.barrier()
