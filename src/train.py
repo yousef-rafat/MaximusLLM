@@ -17,6 +17,7 @@ from contextlib import nullcontext
 from utils import update_model_hf, get_raw_model
 from torch.utils.data import get_worker_info
 import torch.nn.functional as F
+from huggingface_hub import list_repo_files
 
 from transformers.utils import logging
 logging.set_verbosity_error()
@@ -29,7 +30,7 @@ except Exception:
 losses = []
 INDEX = 3490 * torch.cuda.device_count()
 TORCH_COMPILE = True
-USE_FAST_SOFTMAX = True
+USE_FAST_SOFTMAX = False
 LONG_CONTEXT_TRAINING = False
 MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 32768
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
@@ -136,24 +137,37 @@ class HFStreamDataset(IterableDataset):
     def __init__(
         self,
         dataset_name: str = "HuggingFaceFW/fineweb",
+        subset = "CC-MAIN-2024-10",
         take=None,
         rank=0,
         world_size=1,
-        max_retries=5,
+        files_to_skip=0
     ):
         self.dataset_name = dataset_name
+        self.subset = subset
         self.take = take
         self.rank = rank
         self.world_size = world_size
-        self.max_retries = max_retries
-
-        self.skip_n = INDEX * Settings.batch_size
+        self.files_to_skip = files_to_skip
 
         self.tokenizer = AutoTokenizer.from_pretrained("yousefg/MaximusLLM")
         self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
 
+        try:
+            self.all_files = sorted(list_repo_files(
+                dataset_name, 
+                repo_type="dataset",
+                allow_patterns=f"data/{subset}/*.parquet"
+            ))
+            self.all_file_urls = [
+                f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{f}" 
+                for f in self.all_files
+            ]
+        except Exception as e:
+            print(f"Error fetching files: {e}")
+            self.all_file_urls = []
+
     def __iter__(self):
-        
         worker_info = get_worker_info()
         if worker_info is None:
             num_workers = 1
@@ -165,24 +179,28 @@ class HFStreamDataset(IterableDataset):
         global_num_workers = self.world_size * num_workers
         global_worker_id = (self.rank * num_workers) + worker_id
 
-        dataset_stream = None
-        for _ in range(self.max_retries):
-            try:
-                dataset_stream = load_dataset(
-                    self.dataset_name, 
-                    name="CC-MAIN-2024-10", 
-                    split="train", 
-                    streaming=True
-                )
-                break
-            except:  # noqa: E722
-                continue
+        # we shard the file urls between multiple workers
+        my_urls = self.all_file_urls[global_worker_id::global_num_workers]
 
-        if self.skip_n > 0:
-            dataset_stream = islice(dataset_stream, self.skip_n, None)
-            
-        if self.take is not None:
-            dataset_stream = dataset_stream.take(self.take)
+        if self.files_to_skip > 0:
+            print(f"[Rank {self.rank}] Skipping first {self.files_to_skip} files.")
+            my_urls = my_urls[self.files_to_skip:]
+
+        if not my_urls:
+            print(f"[Rank {self.rank} Worker {worker_id}] No files left to process.")
+            return
+
+        print(f"[Rank {self.rank} Worker {worker_id}] Streaming {len(my_urls)} files...")
+
+        ds = load_dataset(
+            "parquet", 
+            data_files=my_urls, 
+            split="train", 
+            streaming=True
+        )
+
+        if self.take:
+            ds = ds.take(self.take)
 
         buffer = []
         batch = []
@@ -201,11 +219,7 @@ class HFStreamDataset(IterableDataset):
                     pad_sequence(attention_masks, batch_first=True, padding_value=0),
                 )
 
-        for i, item in enumerate(dataset_stream):
-
-            if i % global_num_workers != global_worker_id:
-                continue
-
+        for item in ds:
             tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
 
             if PACKING:
@@ -312,7 +326,7 @@ def perplexity(loss):
 def filter_ckpt_for_muon(ckpt, weight_decay=Settings.weight_decay):
     muon_param, adamw_param = [], []
     for name, param in ckpt.named_parameters():
-        if param.dim() < 2:
+        if param.dim() < 2 or "embed" in name or "lm_head" in name:
             adamw_param.append(param)
         else:
             muon_param.append(param)
