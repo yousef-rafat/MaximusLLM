@@ -405,7 +405,7 @@ class Model(nn.Module):
         attention_mask,
         past_key_values = None,
         inputs_embeds = None,
-        use_cache = None,
+        use_cache = False,
         cache_position = None,
         return_hidden = False,
         **kwargs,
@@ -519,3 +519,4 @@ class Config(Gemma3TextConfig):
         self.use_yarn = False # for long context training only
         self.ntk_alpha = 1.0
         self.vocab_size = 262144
+        self.rope_local_base_freq = 10000.0

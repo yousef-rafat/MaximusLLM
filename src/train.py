@@ -2,7 +2,6 @@ import os
 import torch
 import random
 from model import Model, Config
-from itertools import islice
 import torch.distributed as dist
 from datasets import load_dataset
 import torch.multiprocessing as mp
@@ -18,6 +17,7 @@ from utils import update_model_hf, get_raw_model
 from torch.utils.data import get_worker_info
 import torch.nn.functional as F
 from huggingface_hub import list_repo_files
+import fnmatch
 
 from transformers.utils import logging
 logging.set_verbosity_error()
@@ -154,11 +154,16 @@ class HFStreamDataset(IterableDataset):
         self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
 
         try:
-            self.all_files = sorted(list_repo_files(
+            all_repo_files = sorted(list_repo_files(
                 dataset_name, 
                 repo_type="dataset",
-                allow_patterns=f"data/{subset}/*.parquet"
+                token=None
             ))
+
+            filter_pattern = f"data/{subset}/*.parquet"
+            self.all_files = sorted([
+                f for f in all_repo_files if fnmatch.fnmatch(f, filter_pattern)
+            ])
             self.all_file_urls = [
                 f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{f}" 
                 for f in self.all_files
@@ -282,41 +287,36 @@ class HFStreamDataset(IterableDataset):
                     attention_masks.insert(0, torch.ones(MAX_LENGTH))
             yield from return_batch(batch, attention_masks)
 
-# take target embeddings + random embeddings to compute the softmax
-# instead of expensive softmax over 260k vocab size
-def fast_sampled_softmax_loss(hidden_states, target_ids, embedding_weight, n_negatives=4096):
-    batch_size, hidden_dim = hidden_states.shape
-    vocab_size = embedding_weight.shape[0]
+class CentroidPushPullLoss(torch.nn.Module):
+    def __init__(self, embedding_weight, margin=0.25):
+        super().__init__()
+        with torch.no_grad():
+            centroid = embedding_weight.mean(dim=0)
+            self.register_buffer("centroid", F.normalize(centroid, p=2, dim=0))
+        
+        self.embedding_weight = embedding_weight
+        self.margin = margin
+        
+        self.logit_scale = torch.nn.Parameter(torch.ones([]) * 2.3026) 
 
-    scale = torch.sqrt(torch.tensor(hidden_dim, dtype=torch.float32, device=hidden_states.device))
-    
-    target_embeddings = F.embedding(target_ids, embedding_weight)
-    
-    true_logits = (hidden_states * target_embeddings).sum(dim=1, keepdim=True) / scale
+    def forward(self, hidden_states, target_ids):
+        h_norm = F.normalize(hidden_states, p=2, dim=-1)
+        
+        target_emb = F.embedding(target_ids, self.embedding_weight)
+        target_emb_norm = F.normalize(target_emb, p=2, dim=-1)
 
-    random_neg_ids = torch.randint(0, vocab_size, (n_negatives,), device=hidden_states.device)
-    random_neg_vectors = F.embedding(random_neg_ids, embedding_weight)
-    
-    random_neg_logits = torch.matmul(hidden_states, random_neg_vectors.t()) / scale
-    collision_mask = target_ids.unsqueeze(1) == random_neg_ids.unsqueeze(0)
-    random_neg_logits = random_neg_logits.masked_fill(collision_mask, float('-inf'))
+        pos_sim = (h_norm * target_emb_norm).sum(dim=-1)
+        pos_sim = pos_sim - self.margin
 
-    num_batch_neg = min(2048, batch_size)
-    batch_neg_indices = torch.randperm(batch_size, device=hidden_states.device)[:num_batch_neg]
-    batch_neg_vectors = target_embeddings[batch_neg_indices]
-    
-    batch_neg_indices = target_ids[batch_neg_indices]
-    batch_neg_logits = torch.matmul(hidden_states, batch_neg_vectors.t()) / scale
+        neg_sim = torch.matmul(h_norm, self.centroid)
 
-    collision_mask = target_ids.unsqueeze(1) == batch_neg_indices.unsqueeze(0)
-    batch_neg_logits = batch_neg_logits.masked_fill(collision_mask, float("-inf"))
-
-    all_logits = torch.cat([true_logits, random_neg_logits, batch_neg_logits], dim=1)
-
-    # index 0 == target
-    pseudo_labels = torch.zeros(batch_size, dtype=torch.long, device=hidden_states.device)
-    
-    return F.cross_entropy(all_logits, pseudo_labels)
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        
+        logits = torch.stack([pos_sim, neg_sim], dim=1) * scale
+        
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=hidden_states.device)
+        
+        return F.cross_entropy(logits, labels)
 
 def perplexity(loss):
     nll_loss = loss.mean()
@@ -361,14 +361,11 @@ def main(local_rank, world_size):
     prefetch = CUDAPreFetch(dataset, device)
     prefetch.async_load()
     model.gradient_checkpointing = True
-    if not USE_FAST_SOFTMAX:
-        criterion = LigerFusedLinearCrossEntropyLoss()
 
     param_groups = filter_ckpt_for_muon(model, Settings.weight_decay)
 
-    # Split the groups for each optimizer
-    adamw_groups = [group for group in param_groups if group["params"][0].dim() < 2]
-    muon_groups = [group for group in param_groups if group["params"][0].dim() >= 2]
+    adamw_groups = [param_groups[0]] 
+    muon_groups = [param_groups[1]]
 
     if not Settings.use_adamw_only:
         main_optimizer = torch.optim.Muon(muon_groups, lr=Settings.muon_lr)
@@ -405,11 +402,16 @@ def main(local_rank, world_size):
             new_state_dict[new_key] = value
         model.load_state_dict(new_state_dict, strict=False)
         del new_state_dict, checkpoint
+    
+    if not USE_FAST_SOFTMAX:
+        loss_fn = LigerFusedLinearCrossEntropyLoss()
+    else:
+        loss_fn = CentroidPushPullLoss(model.embed_tokens.weight)
 
     model.train()
     if TORCH_COMPILE:
         model = model.to(device)
-        model = torch.compile(model, fullgraph=True, mode="reduce-overhead")
+        model = torch.compile(model, fullgraph=True, mode="default")
     else:
         model = model.to(device)
 
@@ -458,9 +460,9 @@ def main(local_rank, world_size):
                 input_ids = input_ids[:, 1:].long().reshape(-1)
 
                 if USE_FAST_SOFTMAX:
-                    loss = fast_sampled_softmax_loss(logits, input_ids, model.module.lm_head.weight)
+                    loss = loss_fn(logits, input_ids)
                 else:
-                    loss = criterion(
+                    loss = loss_fn(
                         model.module.lm_head.weight,
                         logits,
                         input_ids,
