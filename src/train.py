@@ -66,6 +66,7 @@ class Settings:
     muon_lr = 0.002
     adamw_rate = 4e-4
     use_adamw_only = False
+    margin = 0.30
 
 
 class CUDAPreFetch:
@@ -288,7 +289,7 @@ class HFStreamDataset(IterableDataset):
             yield from return_batch(batch, attention_masks)
 
 class CentroidPushPullLoss(torch.nn.Module):
-    def __init__(self, embedding_weight, margin=0.25):
+    def __init__(self, embedding_weight, margin=Settings.margin, momentum=0.9):
         super().__init__()
         with torch.no_grad():
             centroid = embedding_weight.mean(dim=0)
@@ -296,12 +297,19 @@ class CentroidPushPullLoss(torch.nn.Module):
         
         self.embedding_weight = embedding_weight
         self.margin = margin
+        self.momentum = momentum
         
         self.logit_scale = torch.nn.Parameter(torch.ones([]) * 2.3026) 
 
     def forward(self, hidden_states, target_ids):
-        h_norm = F.normalize(hidden_states, p=2, dim=-1)
         
+        if self.embedding_weight.requires_grad:
+            with torch.no_grad():
+                embed_mean = self.embedding_weight.mean(dim=0)
+                new_centriod = F.normalize(embed_mean, p=2, dim=0)
+                self.centroid.copy_(self.momentum * self.centroid + (1 - self.momentum) * new_centriod)
+
+        h_norm = F.normalize(hidden_states, p=2, dim=-1)
         target_emb = F.embedding(target_ids, self.embedding_weight)
         target_emb_norm = F.normalize(target_emb, p=2, dim=-1)
 
@@ -310,7 +318,8 @@ class CentroidPushPullLoss(torch.nn.Module):
 
         neg_sim = torch.matmul(h_norm, self.centroid)
 
-        scale = self.logit_scale.exp().clamp(max=100.0)
+        # smooth function instead of hard clamp for ddp
+        scale = 100.0 * torch.sigmoid(self.logit_scale) + 1.0
         
         logits = torch.stack([pos_sim, neg_sim], dim=1) * scale
         
