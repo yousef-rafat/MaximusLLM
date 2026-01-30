@@ -66,7 +66,6 @@ class Settings:
     muon_lr = 0.002
     adamw_rate = 4e-4
     use_adamw_only = False
-    margin = 0.30
 
 
 class CUDAPreFetch:
@@ -288,44 +287,83 @@ class HFStreamDataset(IterableDataset):
                     attention_masks.insert(0, torch.ones(MAX_LENGTH))
             yield from return_batch(batch, attention_masks)
 
-class CentroidPushPullLoss(torch.nn.Module):
-    def __init__(self, embedding_weight, margin=Settings.margin, momentum=0.9):
+class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
+    def __init__(self, embedding_weight, low_rank_dim=32, n_candidates=2048, chunk_size=512):
         super().__init__()
-        with torch.no_grad():
-            centroid = embedding_weight.mean(dim=0)
-            self.register_buffer("centroid", F.normalize(centroid, p=2, dim=0))
-        
         self.embedding_weight = embedding_weight
-        self.margin = margin
-        self.momentum = momentum
-        
-        self.logit_scale = torch.nn.Parameter(torch.ones([]) * 2.3026) 
+        self.low_rank_dim = low_rank_dim
+        self.n_candidates = n_candidates
+        self.chunk_size = chunk_size
+        self.logit_scale = torch.nn.Parameter(torch.ones([]) * 2.6592)
 
     def forward(self, hidden_states, target_ids):
         
-        if self.embedding_weight.requires_grad:
-            with torch.no_grad():
-                embed_mean = self.embedding_weight.mean(dim=0)
-                new_centriod = F.normalize(embed_mean, p=2, dim=0)
-                self.centroid.copy_(self.momentum * self.centroid + (1 - self.momentum) * new_centriod)
+        # just to be sure
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        target_ids = target_ids.view(-1)
+        total_tokens = hidden_states.shape[0]
 
-        h_norm = F.normalize(hidden_states, p=2, dim=-1)
-        target_emb = F.embedding(target_ids, self.embedding_weight)
-        target_emb_norm = F.normalize(target_emb, p=2, dim=-1)
+        with torch.no_grad():
+            w_low_norm = F.normalize(self.embedding_weight[:, :self.low_rank_dim], p=2, dim=-1)
+            
+        # norm with grad
+        h_low_all = F.normalize(hidden_states[:, :self.low_rank_dim], p=2, dim=-1)
+        h_full_all = F.normalize(hidden_states, p=2, dim=-1)
 
-        pos_sim = (h_norm * target_emb_norm).sum(dim=-1)
-        pos_sim = pos_sim - self.margin
+        total_main_loss = 0
+        total_aux_loss = 0
 
-        neg_sim = torch.matmul(h_norm, self.centroid)
-
-        # smooth function instead of hard clamp for ddp
+        # (-inf, inf) -> (1.0, 101.0)
         scale = 100.0 * torch.sigmoid(self.logit_scale) + 1.0
-        
-        logits = torch.stack([pos_sim, neg_sim], dim=1) * scale
-        
-        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=hidden_states.device)
-        
-        return F.cross_entropy(logits, labels)
+
+        for i in range(0, total_tokens, self.chunk_size):
+            chunk_end = min(i + self.chunk_size, total_tokens)
+            current_batch = chunk_end - i
+            
+            h_low_chunk = h_low_all[i:chunk_end]
+            target_ids_chunk = target_ids[i:chunk_end]
+
+            # no grad scan
+            local_logits = torch.matmul(h_low_chunk, w_low_norm.t())
+            _, top_indices = torch.topk(local_logits, self.n_candidates, dim=1)
+
+            candidate_embs = self.embedding_weight[top_indices]
+            candidate_embs = F.normalize(candidate_embs, p=2, dim=-1)
+            
+            h_full_chunk = h_full_all[i:chunk_end].view(current_batch, 1, -1)
+
+            full_sims = torch.bmm(h_full_chunk, candidate_embs.transpose(1, 2)).squeeze(1)
+
+            target_full_raw = self.embedding_weight[target_ids_chunk]
+            target_full_emb = F.normalize(target_full_raw, p=2, dim=-1)
+            target_full_sim = (h_full_chunk.squeeze(1) * target_full_emb).sum(dim=-1, keepdim=True)
+            
+            is_target = (top_indices == target_ids_chunk.unsqueeze(1))
+            full_sims = full_sims.masked_fill(is_target, float('-inf'))
+            
+            logits_main = torch.cat([target_full_sim, full_sims], dim=1) * scale
+            
+            labels = torch.zeros(logits_main.shape[0], dtype=torch.long, device=hidden_states.device)
+            total_main_loss += F.cross_entropy(logits_main, labels, reduction='sum')
+
+            # aux loss ////////////
+
+            w_low_candidates = self.embedding_weight[top_indices, :self.low_rank_dim]
+            w_low_candidates = F.normalize(w_low_candidates, p=2, dim=-1)
+            
+            target_low_raw = self.embedding_weight[target_ids_chunk, :self.low_rank_dim]
+            target_low_emb = F.normalize(target_low_raw, p=2, dim=-1)
+            target_low_sim = (h_low_chunk * target_low_emb).sum(dim=-1, keepdim=True)
+            
+            low_sims_candidates = torch.bmm(h_low_chunk.unsqueeze(1), w_low_candidates.transpose(1, 2)).squeeze(1)
+            low_sims_candidates = low_sims_candidates.masked_fill(is_target, float('-inf'))
+            
+            logits_aux = torch.cat([target_low_sim, low_sims_candidates], dim=1) * scale
+            total_aux_loss += F.cross_entropy(logits_aux, labels, reduction='sum')
+            
+            del local_logits, full_sims, logits_main, logits_aux
+
+        return (total_main_loss + (0.5 * total_aux_loss)) / total_tokens
 
 def perplexity(loss):
     nll_loss = loss.mean()
@@ -415,7 +453,7 @@ def main(local_rank, world_size):
     if not USE_FAST_SOFTMAX:
         loss_fn = LigerFusedLinearCrossEntropyLoss()
     else:
-        loss_fn = CentroidPushPullLoss(model.embed_tokens.weight)
+        loss_fn = torch.compile(MatryoshkaSampledSoftmaxLoss(model.embed_tokens.weight))
 
     model.train()
     if TORCH_COMPILE:

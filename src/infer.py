@@ -29,6 +29,7 @@ You are a friendly AI assistant.
 Introduce yourself in one short sentence and say one helpful tip about learning or problem-solving.
 """
 
+@torch.inference_mode()
 def general_generate_fn(model, inputs, eos_token, max_new_tokens = 50, temperature = 1.0, device="cuda"):
 
     if not isinstance(inputs, torch.Tensor):
@@ -41,16 +42,17 @@ def general_generate_fn(model, inputs, eos_token, max_new_tokens = 50, temperatu
     
     generated_ids = inputs.clone()
     past_key_values = None
+    sample = None # <- error silencer
     for i in range(max_new_tokens):
-        current_inputs = inputs if i == 0 else generated_ids[:, :-1]
+        current_inputs = inputs if i == 0 else sample
 
         logits, past_key_values = model(current_inputs,
-                       attention_mask = torch.ones_like(current_inputs),
+                       attention_mask = None,
                        use_cache = True, past_key_values=past_key_values)
-        logits[:, -1:] = logits[:, -1:] if temperature == 1.0 else (logits[:, -1:] / temperature)
-        probs = F.softmax(logits, dim = -1).squeeze(0)
+        new_logit = logits[:, -1] if temperature == 1.0 else (logits[:, -1] / temperature)
+        probs = F.softmax(new_logit, dim = -1)
         sample = torch.multinomial(probs, num_samples = 1)
-        generated_ids = torch.cat([generated_ids, sample.unsqueeze(0)], dim = -1)
+        generated_ids = torch.cat([generated_ids, sample], dim = -1)
 
         if sample.item() == eos_token:
             break
