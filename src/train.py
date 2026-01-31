@@ -548,18 +548,27 @@ def main(local_rank, world_size):
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
+            old_scale = scaler.get_scale()
 
             if not Settings.use_adamw_only:
                 scaler.step(main_optimizer)
             scaler.step(second_optimizer)
             scaler.update()
 
+            new_scale = scaler.get_scale()
+
+            if new_scale >= old_scale:
+                if not Settings.use_adamw_only:
+                    muon_scheduler.step()
+                adam_scheduler.step()
+            else:
+                # may remove this if it got too annoying
+                if local_rank == 0:
+                    print(f"Step {step} was skipped")
+
             if not Settings.use_adamw_only:
                 main_optimizer.zero_grad(set_to_none=True)
-                muon_scheduler.step()
-
             second_optimizer.zero_grad(set_to_none=True)
-            adam_scheduler.step()
 
             if local_rank == 0 and ((step + 1) // ACCUM_STEPS) % 10 == 0:
                 print(
