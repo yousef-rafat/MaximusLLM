@@ -30,7 +30,7 @@ except Exception:
 losses = []
 INDEX = 3490 * torch.cuda.device_count()
 TORCH_COMPILE = True
-USE_FAST_SOFTMAX = False
+USE_FAST_SOFTMAX = True
 LONG_CONTEXT_TRAINING = False
 MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 32768
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
@@ -66,6 +66,7 @@ class Settings:
     muon_lr = 0.002
     adamw_rate = 4e-4
     use_adamw_only = False
+    aux_loss_percent = 0.2
 
 
 class CUDAPreFetch:
@@ -288,7 +289,7 @@ class HFStreamDataset(IterableDataset):
             yield from return_batch(batch, attention_masks)
 
 class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
-    def __init__(self, embedding_weight, low_rank_dim=32, n_candidates=2048, chunk_size=512):
+    def __init__(self, embedding_weight, low_rank_dim=32, n_candidates=2048, chunk_size=128):
         super().__init__()
         self.embedding_weight = embedding_weight
         self.low_rank_dim = low_rank_dim
@@ -296,9 +297,7 @@ class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
         self.chunk_size = chunk_size
         self.logit_scale = torch.nn.Parameter(torch.ones([]) * 2.6592)
 
-    def forward(self, hidden_states, target_ids):
-        
-        # just to be sure
+    def forward(self, hidden_states, target_ids, with_batch_mean=True):
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         target_ids = target_ids.view(-1)
         total_tokens = hidden_states.shape[0]
@@ -306,14 +305,11 @@ class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
         with torch.no_grad():
             w_low_norm = F.normalize(self.embedding_weight[:, :self.low_rank_dim], p=2, dim=-1)
             
-        # norm with grad
         h_low_all = F.normalize(hidden_states[:, :self.low_rank_dim], p=2, dim=-1)
         h_full_all = F.normalize(hidden_states, p=2, dim=-1)
 
         total_main_loss = 0
         total_aux_loss = 0
-
-        # (-inf, inf) -> (1.0, 101.0)
         scale = 100.0 * torch.sigmoid(self.logit_scale) + 1.0
 
         for i in range(0, total_tokens, self.chunk_size):
@@ -322,48 +318,65 @@ class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
             
             h_low_chunk = h_low_all[i:chunk_end]
             target_ids_chunk = target_ids[i:chunk_end]
+            h_full_chunk = h_full_all[i:chunk_end]
 
-            # no grad scan
-            local_logits = torch.matmul(h_low_chunk, w_low_norm.t())
-            _, top_indices = torch.topk(local_logits, self.n_candidates, dim=1)
+            if with_batch_mean:
+                with torch.no_grad():
+                    h_low_mean = h_low_chunk.mean(dim=0, keepdim=True)
+                    chunk_scan_logits = torch.matmul(h_low_mean, w_low_norm.t()) 
+                    _, top_indices = torch.topk(chunk_scan_logits, self.n_candidates, dim=1)
+                    top_indices = top_indices.squeeze(0) # [K]
+                
+                candidate_embs = self.embedding_weight[top_indices]
+                candidate_embs = F.normalize(candidate_embs, p=2, dim=-1)
 
-            candidate_embs = self.embedding_weight[top_indices]
-            candidate_embs = F.normalize(candidate_embs, p=2, dim=-1)
+                full_sims = torch.matmul(h_full_chunk, candidate_embs.t())
+                
+                w_low_candidates = F.normalize(self.embedding_weight[top_indices, :self.low_rank_dim], p=2, dim=-1)
+                low_sims_candidates = torch.matmul(h_low_chunk, w_low_candidates.t())
+
+            else:
+
+                local_logits = torch.matmul(h_low_chunk, w_low_norm.t())
+                _, top_indices = torch.topk(local_logits, self.n_candidates, dim=1) # [Chunk, K]
+
+                candidate_embs = self.embedding_weight[top_indices]
+                candidate_embs = F.normalize(candidate_embs, p=2, dim=-1)
+
+                h_full_bmm = h_full_chunk.view(current_batch, 1, -1)
+                full_sims = torch.bmm(h_full_bmm, candidate_embs.transpose(1, 2)).squeeze(1)
+                
+                w_low_candidates = F.normalize(self.embedding_weight[top_indices, :self.low_rank_dim], p=2, dim=-1)
+                low_sims_candidates = torch.bmm(h_low_chunk.unsqueeze(1), w_low_candidates.transpose(1, 2)).squeeze(1)
+
             
-            h_full_chunk = h_full_all[i:chunk_end].view(current_batch, 1, -1)
-
-            full_sims = torch.bmm(h_full_chunk, candidate_embs.transpose(1, 2)).squeeze(1)
-
-            target_full_raw = self.embedding_weight[target_ids_chunk]
-            target_full_emb = F.normalize(target_full_raw, p=2, dim=-1)
-            target_full_sim = (h_full_chunk.squeeze(1) * target_full_emb).sum(dim=-1, keepdim=True)
+            target_full_emb = F.normalize(self.embedding_weight[target_ids_chunk], p=2, dim=-1)
+            target_full_sim = (h_full_chunk * target_full_emb).sum(dim=-1, keepdim=True)
             
-            is_target = (top_indices == target_ids_chunk.unsqueeze(1))
+            # mask handling
+            if with_batch_mean:
+                 is_target = (top_indices.unsqueeze(0) == target_ids_chunk.unsqueeze(1))
+            else:
+                 is_target = (top_indices == target_ids_chunk.unsqueeze(1))
+
             full_sims = full_sims.masked_fill(is_target, float('-inf'))
             
+            # main
             logits_main = torch.cat([target_full_sim, full_sims], dim=1) * scale
-            
             labels = torch.zeros(logits_main.shape[0], dtype=torch.long, device=hidden_states.device)
             total_main_loss += F.cross_entropy(logits_main, labels, reduction='sum')
 
-            # aux loss ////////////
-
-            w_low_candidates = self.embedding_weight[top_indices, :self.low_rank_dim]
-            w_low_candidates = F.normalize(w_low_candidates, p=2, dim=-1)
-            
-            target_low_raw = self.embedding_weight[target_ids_chunk, :self.low_rank_dim]
-            target_low_emb = F.normalize(target_low_raw, p=2, dim=-1)
+            # aux
+            target_low_emb = F.normalize(self.embedding_weight[target_ids_chunk, :self.low_rank_dim], p=2, dim=-1)
             target_low_sim = (h_low_chunk * target_low_emb).sum(dim=-1, keepdim=True)
             
-            low_sims_candidates = torch.bmm(h_low_chunk.unsqueeze(1), w_low_candidates.transpose(1, 2)).squeeze(1)
             low_sims_candidates = low_sims_candidates.masked_fill(is_target, float('-inf'))
-            
             logits_aux = torch.cat([target_low_sim, low_sims_candidates], dim=1) * scale
             total_aux_loss += F.cross_entropy(logits_aux, labels, reduction='sum')
             
-            del local_logits, full_sims, logits_main, logits_aux
+            del full_sims, logits_main, logits_aux, candidate_embs
 
-        return (total_main_loss + (0.5 * total_aux_loss)) / total_tokens
+        return (total_main_loss + (Settings.aux_loss_percent * total_aux_loss)) / total_tokens
 
 def perplexity(loss):
     nll_loss = loss.mean()
@@ -453,7 +466,7 @@ def main(local_rank, world_size):
     if not USE_FAST_SOFTMAX:
         loss_fn = LigerFusedLinearCrossEntropyLoss()
     else:
-        loss_fn = torch.compile(MatryoshkaSampledSoftmaxLoss(model.embed_tokens.weight))
+        loss_fn = MatryoshkaSampledSoftmaxLoss(model.embed_tokens.weight)
 
     model.train()
     if TORCH_COMPILE:
