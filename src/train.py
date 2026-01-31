@@ -288,8 +288,192 @@ class HFStreamDataset(IterableDataset):
                     attention_masks.insert(0, torch.ones(MAX_LENGTH))
             yield from return_batch(batch, attention_masks)
 
+class MatryoshkaManualFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden_states, embedding_weight, target_ids, logit_scale, 
+                low_rank_dim, n_candidates, chunk_size, with_batch_mean, aux_weight):
+        
+        N, _ = hidden_states.shape
+        device = hidden_states.device
+        
+        sig = torch.sigmoid(logit_scale)
+        scale = 100.0 * sig + 1.0
+
+        h_norm_val = hidden_states.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
+        h_full = hidden_states / h_norm_val
+        h_low = h_full[:, :low_rank_dim]
+
+        with torch.no_grad():
+            w_low_norm = F.normalize(embedding_weight[:, :low_rank_dim], p=2, dim=-1)
+
+        total_loss = torch.tensor(0.0, device=device)
+        saved_chunks = []
+
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            curr_h_f = h_full[i:end]
+            curr_h_l = h_low[i:end]
+            curr_t_ids = target_ids[i:end]
+
+            with torch.no_grad():
+                if with_batch_mean:
+                    h_mean = curr_h_l.mean(dim=0, keepdim=True)
+                    scan_logits = torch.matmul(h_mean, w_low_norm.t())
+                    _, top_indices = torch.topk(scan_logits, n_candidates, dim=1)
+                    top_indices = top_indices.squeeze(0)
+                else:
+                    scan_logits = torch.matmul(curr_h_l, w_low_norm.t())
+                    _, top_indices = torch.topk(scan_logits, n_candidates, dim=1)
+
+            w_f_pos = F.normalize(embedding_weight[curr_t_ids], p=2, dim=-1)
+            w_f_cand = F.normalize(embedding_weight[top_indices], p=2, dim=-1)
+            
+            pos_sims = (curr_h_f * w_f_pos).sum(dim=-1, keepdim=True)
+            
+            if with_batch_mean:
+                neg_sims = torch.matmul(curr_h_f, w_f_cand.t())
+                is_target = (top_indices.unsqueeze(0) == curr_t_ids.unsqueeze(1))
+            else:
+                neg_sims = torch.bmm(curr_h_f.unsqueeze(1), w_f_cand.transpose(1, 2)).squeeze(1)
+                is_target = (top_indices == curr_t_ids.unsqueeze(1))
+            
+            neg_sims = neg_sims.masked_fill(is_target, float('-inf'))
+            logits_m = torch.cat([pos_sims, neg_sims], dim=1) * scale
+            
+            # log softmax for stability
+            log_probs_m = F.log_softmax(logits_m, dim=-1)
+            loss_m = -log_probs_m[:, 0].sum()
+
+            #   aux --------------------------------
+            w_l_pos = w_f_pos[:, :low_rank_dim]
+            w_l_cand = w_f_cand[:, :low_rank_dim]
+            
+            # Re-normalize low rank slices (important for MRL!)
+            w_l_pos = F.normalize(w_l_pos, p=2, dim=-1)
+            w_l_cand = F.normalize(w_l_cand, p=2, dim=-1)
+            
+            low_pos = (curr_h_l * w_l_pos).sum(dim=-1, keepdim=True)
+            if with_batch_mean:
+                low_neg = torch.matmul(curr_h_l, w_l_cand.t())
+            else:
+                low_neg = torch.bmm(curr_h_l.unsqueeze(1), w_l_cand.transpose(1, 2)).squeeze(1)
+            
+            low_neg = low_neg.masked_fill(is_target, float('-inf'))
+            logits_a = torch.cat([low_pos, low_neg], dim=1) * scale
+            
+            log_probs_a = F.log_softmax(logits_a, dim=-1)
+            loss_a = -log_probs_a[:, 0].sum()
+
+            total_loss += (loss_m + aux_weight * loss_a)
+
+            # save softmax probs
+            saved_chunks.append((
+                curr_h_f, curr_t_ids, top_indices, 
+                log_probs_m.exp(), log_probs_a.exp(), 
+                w_f_pos, w_f_cand, w_l_pos, w_l_cand,
+                logits_m, logits_a
+            ))
+
+        ctx.save_for_backward(logit_scale, hidden_states, embedding_weight, h_norm_val)
+        ctx.aux_weight = aux_weight
+        ctx.with_batch_mean = with_batch_mean
+        ctx.low_rank_dim = low_rank_dim
+        ctx.saved_chunks = saved_chunks
+        
+        return total_loss / N
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logit_scale, hidden_states, embedding_weight, h_norm_val = ctx.saved_tensors
+        aux_weight = ctx.aux_weight
+        with_batch_mean = ctx.with_batch_mean
+        low_rank_dim = ctx.low_rank_dim
+        
+        # sigmoid derivative -> sig * (1 - sig)
+        sig = torch.sigmoid(logit_scale)
+        scale = 100.0 * sig + 1.0
+        d_scale_factor = 100.0 * sig * (1.0 - sig)
+        
+        N, H = hidden_states.shape
+        total_tokens = N
+        
+        grad_h_normalized = torch.zeros_like(hidden_states)
+        grad_embed = torch.zeros_like(embedding_weight)
+        grad_scale_accum = torch.tensor(0.0, device=grad_output.device)
+
+        chunk_size = ctx.saved_chunks[0][0].shape[0]
+        grad_embed_low = grad_embed[:, :low_rank_dim]
+
+        for i, chunk in enumerate(ctx.saved_chunks):
+            (h_f, t_ids, top_idx, p_m, p_a, w_fp, w_fc, w_lp, w_lc, l_m, l_a) = chunk
+            
+            # index 0 = label
+            # CE gradient = (softmax - label)
+            dz_m = p_m
+            dz_m[:, 0] -= 1.0
+
+            dz_m = dz_m * (grad_output / total_tokens) * scale
+            
+            dz_a = p_a
+            dz_a[:, 0] -= 1.0
+            dz_a = dz_a * (grad_output / total_tokens) * scale * aux_weight
+
+            # main loss
+            gh_m = dz_m[:, :1] * w_fp
+            if with_batch_mean:
+                gh_m += torch.matmul(dz_m[:, 1:], w_fc)
+            else:
+                gh_m += torch.bmm(dz_m[:, 1:].unsqueeze(1), w_fc).squeeze(1)
+            
+            # part of aux loss
+            gh_a_low = dz_a[:, :1] * w_lp
+            if with_batch_mean:
+                gh_a_low += torch.matmul(dz_a[:, 1:], w_lc)
+            else:
+                gh_a_low += torch.bmm(dz_a[:, 1:].unsqueeze(1), w_lc).squeeze(1)
+            
+            gh_m[:, :low_rank_dim] += gh_a_low
+            
+            grad_h_normalized[i*chunk_size : i*chunk_size + h_f.shape[0]] = gh_m
+
+            grad_embed.index_add_(0, t_ids, dz_m[:, :1] * h_f)
+            
+            if with_batch_mean:
+                grad_w_neg = torch.matmul(dz_m[:, 1:].t(), h_f)
+                grad_embed.index_add_(0, top_idx, grad_w_neg)
+            else:
+                grad_w_neg = torch.bmm(dz_m[:, 1:].unsqueeze(2), h_f.unsqueeze(1))
+                for b in range(h_f.shape[0]):
+                    grad_embed.index_add_(0, top_idx[b], grad_w_neg[b])
+
+            h_l = h_f[:, :low_rank_dim] 
+            grad_embed_low.index_add_(0, t_ids, dz_a[:, :1] * h_l)
+            
+            # AUX LOSS -----------------------------------------
+
+            if with_batch_mean:
+                grad_w_low_neg = torch.matmul(dz_a[:, 1:].t(), h_l)
+                grad_embed_low.index_add_(0, top_idx, grad_w_low_neg)
+            else:
+                # per token
+                for b in range(h_f.shape[0]):
+                    g_w_l_b = dz_a[b, 1:].unsqueeze(1) * h_l[b].unsqueeze(0)
+                    grad_embed_low.index_add_(0, top_idx[b], g_w_l_b)
+
+            grad_scale_accum += (dz_m * l_m / scale).sum() + (dz_a * l_a / scale).sum()
+
+        # l2 norm formula -> grad_raw = (grad_norm - h_norm * (h_norm . grad_norm)) / norm_val        
+        h_full_recalc = hidden_states / h_norm_val
+        
+        dot = (grad_h_normalized * h_full_recalc).sum(dim=-1, keepdim=True)
+        grad_h = (grad_h_normalized - h_full_recalc * dot) / h_norm_val
+
+        grad_logit_scale = grad_scale_accum * d_scale_factor
+
+        return grad_h, grad_embed, None, grad_logit_scale, None, None, None, None, None
+
 class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
-    def __init__(self, embedding_weight, low_rank_dim=32, n_candidates=2048, chunk_size=128):
+    def __init__(self, embedding_weight, low_rank_dim=64, n_candidates=2048, chunk_size=64):
         super().__init__()
         self.embedding_weight = embedding_weight
         self.low_rank_dim = low_rank_dim
@@ -298,85 +482,17 @@ class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
         self.logit_scale = torch.nn.Parameter(torch.ones([]) * 2.6592)
 
     def forward(self, hidden_states, target_ids, with_batch_mean=True):
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        target_ids = target_ids.view(-1)
-        total_tokens = hidden_states.shape[0]
-
-        with torch.no_grad():
-            w_low_norm = F.normalize(self.embedding_weight[:, :self.low_rank_dim], p=2, dim=-1)
-            
-        h_low_all = F.normalize(hidden_states[:, :self.low_rank_dim], p=2, dim=-1)
-        h_full_all = F.normalize(hidden_states, p=2, dim=-1)
-
-        total_main_loss = 0
-        total_aux_loss = 0
-        scale = 100.0 * torch.sigmoid(self.logit_scale) + 1.0
-
-        for i in range(0, total_tokens, self.chunk_size):
-            chunk_end = min(i + self.chunk_size, total_tokens)
-            current_batch = chunk_end - i
-            
-            h_low_chunk = h_low_all[i:chunk_end]
-            target_ids_chunk = target_ids[i:chunk_end]
-            h_full_chunk = h_full_all[i:chunk_end]
-
-            if with_batch_mean:
-                with torch.no_grad():
-                    h_low_mean = h_low_chunk.mean(dim=0, keepdim=True)
-                    chunk_scan_logits = torch.matmul(h_low_mean, w_low_norm.t()) 
-                    _, top_indices = torch.topk(chunk_scan_logits, self.n_candidates, dim=1)
-                    top_indices = top_indices.squeeze(0) # [K]
-                
-                candidate_embs = self.embedding_weight[top_indices]
-                candidate_embs = F.normalize(candidate_embs, p=2, dim=-1)
-
-                full_sims = torch.matmul(h_full_chunk, candidate_embs.t())
-                
-                w_low_candidates = F.normalize(self.embedding_weight[top_indices, :self.low_rank_dim], p=2, dim=-1)
-                low_sims_candidates = torch.matmul(h_low_chunk, w_low_candidates.t())
-
-            else:
-
-                local_logits = torch.matmul(h_low_chunk, w_low_norm.t())
-                _, top_indices = torch.topk(local_logits, self.n_candidates, dim=1) # [Chunk, K]
-
-                candidate_embs = self.embedding_weight[top_indices]
-                candidate_embs = F.normalize(candidate_embs, p=2, dim=-1)
-
-                h_full_bmm = h_full_chunk.view(current_batch, 1, -1)
-                full_sims = torch.bmm(h_full_bmm, candidate_embs.transpose(1, 2)).squeeze(1)
-                
-                w_low_candidates = F.normalize(self.embedding_weight[top_indices, :self.low_rank_dim], p=2, dim=-1)
-                low_sims_candidates = torch.bmm(h_low_chunk.unsqueeze(1), w_low_candidates.transpose(1, 2)).squeeze(1)
-
-            
-            target_full_emb = F.normalize(self.embedding_weight[target_ids_chunk], p=2, dim=-1)
-            target_full_sim = (h_full_chunk * target_full_emb).sum(dim=-1, keepdim=True)
-            
-            # mask handling
-            if with_batch_mean:
-                 is_target = (top_indices.unsqueeze(0) == target_ids_chunk.unsqueeze(1))
-            else:
-                 is_target = (top_indices == target_ids_chunk.unsqueeze(1))
-
-            full_sims = full_sims.masked_fill(is_target, float('-inf'))
-            
-            # main
-            logits_main = torch.cat([target_full_sim, full_sims], dim=1) * scale
-            labels = torch.zeros(logits_main.shape[0], dtype=torch.long, device=hidden_states.device)
-            total_main_loss += F.cross_entropy(logits_main, labels, reduction='sum')
-
-            # aux
-            target_low_emb = F.normalize(self.embedding_weight[target_ids_chunk, :self.low_rank_dim], p=2, dim=-1)
-            target_low_sim = (h_low_chunk * target_low_emb).sum(dim=-1, keepdim=True)
-            
-            low_sims_candidates = low_sims_candidates.masked_fill(is_target, float('-inf'))
-            logits_aux = torch.cat([target_low_sim, low_sims_candidates], dim=1) * scale
-            total_aux_loss += F.cross_entropy(logits_aux, labels, reduction='sum')
-            
-            del full_sims, logits_main, logits_aux, candidate_embs
-
-        return (total_main_loss + (Settings.aux_loss_percent * total_aux_loss)) / total_tokens
+        return MatryoshkaManualFunction.apply(
+            hidden_states, 
+            self.embedding_weight, 
+            target_ids, 
+            self.logit_scale,
+            self.low_rank_dim,
+            self.n_candidates,
+            self.chunk_size,
+            with_batch_mean,
+            Settings.aux_loss_percent
+        )
 
 def perplexity(loss):
     nll_loss = loss.mean()
@@ -471,7 +587,10 @@ def main(local_rank, world_size):
     model.train()
     if TORCH_COMPILE:
         model = model.to(device)
-        model = torch.compile(model, fullgraph=True, mode="default")
+        #model = torch.compile(model, fullgraph=True, mode="default")
+        # avoid problems with custom autograd fn and compiling
+        for i, block in enumerate(model.layers):
+            model.layers[i] = torch.compile(block, mode="default", fullgraph=True)
     else:
         model = model.to(device)
 
@@ -592,6 +711,8 @@ def main(local_rank, world_size):
 
     if local_rank == 0:
         save_model(get_raw_model(model), "model.safetensors")
+        if hasattr(os, 'sync'):
+            os.sync()
         update_model_hf(os.path.abspath("model.safetensors"))
         print("model saved")
 
