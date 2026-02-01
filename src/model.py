@@ -195,6 +195,7 @@ class Attention(nn.Module):
         rope_logit = 0.01
         logit = torch.log(torch.tensor(rope_logit) / (1.0 - torch.tensor(rope_logit)))
         self.rope_global_local_logit = nn.Parameter(logit)
+        self.rope_fn = _apply_rotary_emb
 
     def compute_freq_gl(self, pos_embed):
         cos_g, sin_g, cos_l, sin_l = pos_embed
