@@ -62,9 +62,12 @@ class RandNLAGQALayer(nn.Module):
         self.num_kv_heads = original_layer.num_key_value_heads
         self.head_dim = original_layer.head_dim
         
-        sketch = torch.empty(sketch_size, self.max_context)
-        nn.init.orthogonal_(sketch)
-        self.register_buffer("P", sketch * math.sqrt(self.max_context / sketch_size))
+        #  (640, 32768)
+        self.kron_a = nn.Parameter(torch.randn(20, 128))
+        self.kron_b = nn.Parameter(torch.randn(32, 256))
+
+        nn.init.orthogonal_(self.kron_a)
+        nn.init.orthogonal_(self.kron_b)
 
         self.importance_scorer = nn.Sequential(
             nn.Linear(hidden_size, 64),
@@ -84,6 +87,10 @@ class RandNLAGQALayer(nn.Module):
 
         importance_weights = torch.sigmoid(importance_logits)
         return importance_weights
+    
+    def get_p(self, seq_len):
+        P = torch.kron(self.kron_a, self.kron_b)
+        return P[:, :seq_len]
 
     def forward(self, x, attention_mask=None, positional_emb=None, **kwargs):
         bsz, seq_len, _ = x.shape
@@ -102,7 +109,7 @@ class RandNLAGQALayer(nn.Module):
         q = self.target_layer.q_norm(q)
         k = self.target_layer.k_norm(k)
 
-        P_curr = self.P[:, :seq_len] 
+        P_curr = self.get_p(seq_len)
 
         k_weighted = k * importance_weights.unsqueeze(-1)
         v_weighted = v * importance_weights.unsqueeze(-1)
@@ -167,7 +174,7 @@ class RandNLALatentAttention(RandNLAGQALayer):
 
         c_kv = c_kv * importance_weights
 
-        P_curr = self.P[:, :seq_len]
+        P_curr = self.get_p(seq_len)
         
         c_kv_t = c_kv.transpose(1, 2)
         c_kv_sketched = torch.matmul(c_kv_t, P_curr.t())
