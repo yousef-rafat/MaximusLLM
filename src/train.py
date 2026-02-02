@@ -1,6 +1,7 @@
 import os
 import torch
 import random
+import fnmatch
 from model import Model, Config
 import torch.distributed as dist
 from datasets import load_dataset
@@ -13,11 +14,10 @@ from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file, save_model
 from contextlib import nullcontext
-from utils import update_model_hf, get_raw_model
 from torch.utils.data import get_worker_info
 import torch.nn.functional as F
 from huggingface_hub import list_repo_files
-import fnmatch
+from utils import update_model_hf, get_raw_model, get_global_loss
 
 from transformers.utils import logging
 logging.set_verbosity_error()
@@ -67,6 +67,7 @@ class Settings:
     adamw_rate = 4e-4
     use_adamw_only = False
     aux_loss_percent = 0.2
+    loss_ema_beta = 0.95
 
 
 class CUDAPreFetch:
@@ -611,6 +612,8 @@ def main(local_rank, world_size):
     step = 0
     # TODO: check if it skips the first batch
     batch = prefetch.next()  # .next()
+    running_loss = 0
+    smoothed_loss = None
 
     while batch is not None:
         inputs = batch
@@ -650,7 +653,8 @@ def main(local_rank, world_size):
                 loss = loss / ACCUM_STEPS
 
             scaler.scale(loss).backward()
-
+        
+        running_loss += loss.detach().item()
         if (step + 1) % ACCUM_STEPS == 0:
             if not Settings.use_adamw_only:
                 scaler.unscale_(main_optimizer)
@@ -689,11 +693,18 @@ def main(local_rank, world_size):
                 main_optimizer.zero_grad(set_to_none=True)
             second_optimizer.zero_grad(set_to_none=True)
 
+            true_loss = get_global_loss(running_loss, world_size)
+            if smoothed_loss is None:
+                smoothed_loss = true_loss
+            smoothed_loss = Settings.loss_ema_beta * smoothed_loss + (1 - Settings.loss_ema_beta) * true_loss
+
             if local_rank == 0 and ((step + 1) // ACCUM_STEPS) % 10 == 0:
                 print(
-                    f"step {(step // ACCUM_STEPS):05d} | loss {(loss.item() * ACCUM_STEPS):.4f}"
+                    f"step {(step // ACCUM_STEPS):05d} | loss {(smoothed_loss):.4f}"
                 )
-                losses.append(loss.detach().cpu())
+                #losses.append(loss.detach().cpu())
+            
+            running_loss = 0
             
 
         del input_ids, attention_mask, logits, loss

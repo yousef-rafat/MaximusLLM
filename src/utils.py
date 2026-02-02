@@ -3,6 +3,7 @@ from huggingface_hub import upload_file, delete_file
 from safetensors.torch import save_file
 import tempfile
 import os
+import torch.distributed as dist
 
 def update_model_hf(model_path, hf_dir="yousefg/MaximusLLM", token="", full_replace=False):
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -55,3 +56,10 @@ def clean_checkpoint(checkpoint):
             k = k.replace("_orig_mod.", "", 1)
         new_checkpoint[k] = v
     return new_checkpoint
+
+def get_global_loss(running_loss, world_size):
+    if not (world_size > 1):
+        return running_loss
+    t = torch.tensor([running_loss], device="cuda")
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t.item() / world_size
