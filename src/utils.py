@@ -1,6 +1,6 @@
 import torch
 from huggingface_hub import upload_file, delete_file
-from safetensors.torch import save_file
+from safetensors.torch import save_file, save_model
 import tempfile
 import os
 import torch.distributed as dist
@@ -57,8 +57,9 @@ def save_maximus_checkpoint(model, path):
     for k, v in state_dict.items():
         new_k = k.replace("module.", "").replace("_orig_mod.", "")
         clean_dict[new_k] = v
-        
-    save_file(clean_dict, path)
+    
+    model.load_state_dict(clean_dict)
+    save_model(model, path)
     print(f"checkpoint saved to {path}")
 
 def get_global_loss(running_loss, world_size):
