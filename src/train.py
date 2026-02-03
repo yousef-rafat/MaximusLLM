@@ -1,6 +1,5 @@
 import os
 import torch
-import copy
 import random
 import fnmatch
 from model import Model, Config
