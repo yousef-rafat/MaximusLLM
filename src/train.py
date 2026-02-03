@@ -12,13 +12,13 @@ from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file, save_model
+from safetensors.torch import load_file
 from contextlib import nullcontext
 from torch.utils.data import get_worker_info
 from itertools import islice
 import torch.nn.functional as F
 from huggingface_hub import list_repo_files
-from utils import update_model_hf, get_raw_model, get_global_loss
+from utils import update_model_hf, get_global_loss, save_maximus_checkpoint
 
 from transformers.utils import logging
 logging.set_verbosity_error()
@@ -159,7 +159,7 @@ class HFStreamDataset(IterableDataset):
         self.TOKENS_PER_FILE_EST = 500_000_000 
         self.ROWS_PER_FILE_EST = 300_000 
 
-        tokens_processed = INDEX * Settings.batch_size * ACCUM_STEPS * world_size * MAX_LENGTH
+        tokens_processed = INDEX * Settings.batch_size * world_size * MAX_LENGTH
 
         tokens_per_worker = tokens_processed / world_size
         
@@ -742,7 +742,7 @@ def main(local_rank, world_size):
         step += 1
 
         if step % SAVE_EVERY_STEP == 0 and local_rank == 0:
-            save_model(get_raw_model(model), f"model_{step}.safetensors")
+            save_maximus_checkpoint(model, f"model_{step}.safetensors")
 
         if step == (TOTAL_NUMBER_OF_STEPS * ACCUM_STEPS):
             break
@@ -750,7 +750,7 @@ def main(local_rank, world_size):
     dist.barrier()
 
     if local_rank == 0:
-        save_model(get_raw_model(model), "model.safetensors")
+        save_maximus_checkpoint(model, "model.safetensors")
         if hasattr(os, 'sync'):
             os.sync()
         update_model_hf(os.path.abspath("model.safetensors"))

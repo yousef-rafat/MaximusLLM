@@ -40,22 +40,26 @@ def update_model_hf(model_path, hf_dir="yousefg/MaximusLLM", token="", full_repl
                 token=token
             )
 
-def get_raw_model(model):
-    if hasattr(model, "module"):
-        model = model.module
-    if hasattr(model, "_orig_mod"):
-        model = model._orig_mod
-    return model
-
 def clean_checkpoint(checkpoint):
-    new_checkpoint = {}
+    new_state_dict = {}
+
     for k, v in checkpoint.items():
-        if k.startswith("module."):
-            k = k.replace("module.", "", 1)
-        if k.startswith("_orig_mod."):
-            k = k.replace("_orig_mod.", "", 1)
-        new_checkpoint[k] = v
-    return new_checkpoint
+        new_k = k.replace("module.", "")
+        new_k = new_k.replace("_orig_mod.", "")
+        new_state_dict[new_k] = v
+        
+    return new_state_dict
+
+def save_maximus_checkpoint(model, path):
+    state_dict = model.state_dict()
+    
+    clean_dict = {}
+    for k, v in state_dict.items():
+        new_k = k.replace("module.", "").replace("_orig_mod.", "")
+        clean_dict[new_k] = v
+        
+    save_file(clean_dict, path)
+    print(f"checkpoint saved to {path}")
 
 def get_global_loss(running_loss, world_size):
     if not (world_size > 1):
