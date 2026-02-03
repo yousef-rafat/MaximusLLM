@@ -15,6 +15,7 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file, save_model
 from contextlib import nullcontext
 from torch.utils.data import get_worker_info
+from itertools import islice
 import torch.nn.functional as F
 from huggingface_hub import list_repo_files
 from utils import update_model_hf, get_raw_model, get_global_loss
@@ -28,7 +29,7 @@ except Exception:
     pass
 
 losses = []
-INDEX = 3490 * torch.cuda.device_count()
+INDEX = 1_984 * torch.cuda.device_count()
 TORCH_COMPILE = True
 USE_FAST_SOFTMAX = True
 LONG_CONTEXT_TRAINING = False
@@ -155,6 +156,26 @@ class HFStreamDataset(IterableDataset):
         self.tokenizer = AutoTokenizer.from_pretrained("yousefg/MaximusLLM")
         self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
 
+        self.TOKENS_PER_FILE_EST = 500_000_000 
+        self.ROWS_PER_FILE_EST = 300_000 
+
+        tokens_processed = INDEX * Settings.batch_size * ACCUM_STEPS * world_size * MAX_LENGTH
+
+        tokens_per_worker = tokens_processed / world_size
+        
+        self.files_per_worker_skipped = int(tokens_per_worker // self.TOKENS_PER_FILE_EST)
+        
+        # how far in the file
+        tokens_remainder = tokens_per_worker % self.TOKENS_PER_FILE_EST
+        percent_done = tokens_remainder / self.TOKENS_PER_FILE_EST
+        
+        self.rows_to_skip = int(percent_done * self.ROWS_PER_FILE_EST)
+
+        if INDEX > 0 and self.rank == 0:
+            print(f"Resuming Step {INDEX} | Total Processed: {tokens_processed/1e9:.2f}B tokens")
+            print(f"Skipping {self.files_per_worker_skipped} full files per worker.")
+            print(f"Skipping first {self.rows_to_skip} rows in the active file.")
+
         try:
             all_repo_files = sorted(list_repo_files(
                 dataset_name, 
@@ -189,9 +210,12 @@ class HFStreamDataset(IterableDataset):
         # we shard the file urls between multiple workers
         my_urls = self.all_file_urls[global_worker_id::global_num_workers]
 
-        if self.files_to_skip > 0:
-            print(f"[Rank {self.rank}] Skipping first {self.files_to_skip} files.")
-            my_urls = my_urls[self.files_to_skip:]
+        if self.files_per_worker_skipped > 0:
+            if self.files_per_worker_skipped < len(my_urls):
+                my_urls = my_urls[self.files_per_worker_skipped:]
+            else:
+                print(f"[Rank {self.rank}] Worker {worker_id} has finished all assigned files.")
+                return
 
         if not my_urls:
             print(f"[Rank {self.rank} Worker {worker_id}] No files left to process.")
@@ -226,7 +250,11 @@ class HFStreamDataset(IterableDataset):
                     pad_sequence(attention_masks, batch_first=True, padding_value=0),
                 )
 
-        for item in ds:
+        ds_iterator = iter(ds)
+        if self.rows_to_skip > 0:
+            ds_iterator = islice(ds_iterator, self.rows_to_skip, None)
+
+        for item in ds_iterator:
             tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
 
             if PACKING:
@@ -600,6 +628,7 @@ def main(local_rank, world_size):
         output_device=local_rank,
         device_ids=[local_rank],
         find_unused_parameters=False,
+        bucket_cap_mb=100,
     )
 
     # quantization
