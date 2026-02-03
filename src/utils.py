@@ -1,6 +1,6 @@
 import torch
 from huggingface_hub import upload_file, delete_file
-from safetensors.torch import save_file, save_model
+from safetensors.torch import save_file
 import tempfile
 import os
 import torch.distributed as dist
@@ -33,12 +33,25 @@ def update_model_hf(model_path, hf_dir="yousefg/MaximusLLM", token="", full_repl
             token=token
         )
 
-        if full_replace:
-            delete_file(
-                path_in_repo="model_test.safetensors",
-                repo_id = hf_dir,
-                token=token
-            )
+        # will uncomment
+        #if full_replace:
+        #    delete_file(
+        #        path_in_repo="model_test.safetensors",
+        #        repo_id = hf_dir,
+        #        token=token
+        #    )
+
+def get_raw_model(model):
+    def clean(m):
+        if hasattr(m, "module"):
+            m = m.module
+        if hasattr(m, "_orig_mod"):
+            m = m._orig_mod
+        return m
+    model = clean(model)
+    for i, layer in enumerate(model.layers):
+        model.layers[i] = clean(layer)
+    return model
 
 def clean_checkpoint(checkpoint):
     new_state_dict = {}
@@ -49,18 +62,6 @@ def clean_checkpoint(checkpoint):
         new_state_dict[new_k] = v
         
     return new_state_dict
-
-def save_maximus_checkpoint(model, path):
-    state_dict = model.state_dict()
-    
-    clean_dict = {}
-    for k, v in state_dict.items():
-        new_k = k.replace("module.", "").replace("_orig_mod.", "")
-        clean_dict[new_k] = v
-    
-    model.load_state_dict(clean_dict)
-    save_model(model, path)
-    print(f"checkpoint saved to {path}")
 
 def get_global_loss(running_loss, world_size):
     if not (world_size > 1):

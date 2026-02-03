@@ -1,5 +1,6 @@
 import os
 import torch
+import copy
 import random
 import fnmatch
 from model import Model, Config
@@ -12,13 +13,13 @@ from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_model
 from contextlib import nullcontext
 from torch.utils.data import get_worker_info
 from itertools import islice
 import torch.nn.functional as F
 from huggingface_hub import list_repo_files
-from utils import update_model_hf, get_global_loss, save_maximus_checkpoint
+from utils import update_model_hf, get_global_loss, get_raw_model
 
 from transformers.utils import logging
 logging.set_verbosity_error()
@@ -741,8 +742,9 @@ def main(local_rank, world_size):
         batch = next_batch
         step += 1
 
+        # TODO
         if step % SAVE_EVERY_STEP == 0 and local_rank == 0:
-            save_maximus_checkpoint(model, f"model_{step}.safetensors")
+            save_model(get_raw_model(model), f"model_{step}.safetensors")
 
         if step == (TOTAL_NUMBER_OF_STEPS * ACCUM_STEPS):
             break
@@ -750,7 +752,7 @@ def main(local_rank, world_size):
     dist.barrier()
 
     if local_rank == 0:
-        save_maximus_checkpoint(model, "model.safetensors")
+        save_model(get_raw_model(model), "model.safetensors")
         if hasattr(os, 'sync'):
             os.sync()
         update_model_hf(os.path.abspath("model.safetensors"))
