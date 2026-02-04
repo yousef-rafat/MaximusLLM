@@ -14,9 +14,12 @@ def create_causal_padding_mask(attention_mask, seq_len, dtype, device):
     else:
         min_val = -1e9
 
-    if attention_mask.dim() > 3: # packing
+    if attention_mask.dim() >= 3: # packing
+        if attention_mask.dim() == 3:
+            attention_mask = attention_mask.unsqueeze(1)
+            
         final_mask = torch.zeros_like(attention_mask, dtype=dtype, device=device)        
-        final_mask = final_mask.masked_fill(attention_mask, min_val)
+        final_mask = final_mask.masked_fill(~attention_mask, min_val)
         return final_mask
 
     batch_size = attention_mask.shape[0]
@@ -437,12 +440,10 @@ class Model(nn.Module):
         cos_g, sin_g = self.rotary_emb._compute_cos_sin(seq_len)
         cos_l, sin_l = self.rotary_emb_local._compute_cos_sin(seq_len)
 
-        # inference
-        if use_cache:
-            cos_g = cos_g[cache_position]
-            sin_g = sin_g[cache_position]
-            cos_l = cos_l[cache_position]
-            sin_l = sin_l[cache_position]
+        cos_g = cos_g[cache_position]
+        sin_g = sin_g[cache_position]
+        cos_l = cos_l[cache_position]
+        sin_l = sin_l[cache_position]
 
         positional_embeddings = (cos_g, sin_g, cos_l, sin_l)
 
@@ -465,6 +466,8 @@ class Model(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         if return_hidden:
+            if use_cache:
+                return hidden_states, past_key_values
             return hidden_states
         logits = self.lm_head(hidden_states)
 

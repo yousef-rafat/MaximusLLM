@@ -118,22 +118,34 @@ class CUDAPreFetch:
         return batch_gpu
 
 
-def diagonal_attn_mask(seq, eos_token):
-    T = len(seq)
-    is_eos = seq == eos_token
-    doc_ids = is_eos.cumsum(0).roll(1)
-    doc_ids[0] = 0
+def get_packed_mask_and_pos_ids(input_ids, eos_token_id):
+    B, T = input_ids.shape
+    device = input_ids.device
 
-    row = doc_ids.unsqueeze(0).expand(T, T)
-    col = doc_ids.unsqueeze(1).expand(T, T)
-    diff_doc_mask = row != col
+    is_eos = (input_ids == eos_token_id)
 
-    causal_mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+    doc_ids = is_eos.cumsum(dim=1).roll(shifts=1, dims=1)
+    doc_ids[:, 0] = 0
+    
+    seq_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+    
+    first_token_mask = torch.zeros_like(is_eos)
+    first_token_mask[:, 1:] = is_eos[:, :-1]
+    
+    offsets = torch.where(first_token_mask, seq_idx, torch.zeros_like(seq_idx))
+    offsets = offsets.cummax(dim=1)[0]
+    position_ids = seq_idx - offsets
 
-    combined_mask = diff_doc_mask | causal_mask
-    ids = torch.arange(len(seq), device=seq.device)
-    combined_mask[ids, ids] = False
-    return combined_mask
+    row_doc = doc_ids.unsqueeze(2)
+    col_doc = doc_ids.unsqueeze(1)
+    
+    doc_mask = (row_doc == col_doc)
+    
+    causal_mask = torch.tril(torch.ones((T, T), device=device, dtype=torch.bool))
+
+    mask = doc_mask & causal_mask.unsqueeze(0)
+    
+    return mask, position_ids
 
 
 class HFStreamDataset(IterableDataset):
@@ -235,20 +247,13 @@ class HFStreamDataset(IterableDataset):
 
         buffer = []
         batch = []
-        attention_masks = []
 
-        def return_batch(batch, attention_masks=None):
-            if LONG_CONTEXT_TRAINING or PACKING:
-                if isinstance(batch, list):
-                    b = torch.stack(batch)
-                else:
-                    b = torch.tensor(batch, dtype=torch.long)
-                yield b, torch.ones_like(b)
+        def return_batch(batch):
+            if isinstance(batch, list):
+                b = torch.stack(batch)
             else:
-                yield (
-                    pad_sequence(batch, batch_first=True),
-                    pad_sequence(attention_masks, batch_first=True, padding_value=0),
-                )
+                b = torch.tensor(batch, dtype=torch.long)
+            yield b 
 
         ds_iterator = iter(ds)
         if self.rows_to_skip > 0:
@@ -288,12 +293,10 @@ class HFStreamDataset(IterableDataset):
                 tokens = tokens[: MAX_LENGTH - 2]
                 tokens += [self.eos_token]
                 batch.append(torch.tensor(tokens))
-                attention_masks.append(torch.ones(len(tokens)))
 
             if len(batch) == Settings.batch_size:
-                yield from return_batch(batch, attention_masks)
+                yield from return_batch(batch)
                 batch = []
-                attention_masks = []
 
         if buffer and not PACKING:
             batch.append(buffer[:MAX_LENGTH])
@@ -301,21 +304,15 @@ class HFStreamDataset(IterableDataset):
             seq = torch.tensor(buffer, dtype=torch.long)
             pad_len = MAX_LENGTH - len(seq)
             if pad_len > 0:
-                mask = torch.cat([torch.ones(len(seq)), torch.zeros(pad_len)])
                 seq = torch.nn.functional.pad(
                     seq, (0, pad_len), value=self.tokenizer.pad_token_id or 0
                 )
                 batch.append(seq)
-                attention_masks = [mask]
             else:
                 batch.append(seq)
-                attention_masks = []
 
         if batch:
-            if PACKING and attention_masks:
-                while len(attention_masks) < len(batch):
-                    attention_masks.insert(0, torch.ones(MAX_LENGTH))
-            yield from return_batch(batch, attention_masks)
+            yield from return_batch(batch)
 
 class MatryoshkaManualFunction(torch.autograd.Function):
     @staticmethod
@@ -643,6 +640,7 @@ def main(local_rank, world_size):
     batch = prefetch.next()  # .next()
     running_loss = 0
     smoothed_loss = None
+    eos_token = dataset.eos_token
 
     while batch is not None:
         inputs = batch
@@ -655,7 +653,8 @@ def main(local_rank, world_size):
             with torch.amp.autocast(
                 enabled=True, device_type=f"cuda:{local_rank}", dtype=dtype
             ):
-                input_ids, attention_mask = inputs
+                input_ids = inputs
+                attention_mask, position_ids = get_packed_mask_and_pos_ids(input_ids, eos_token)
                 # safety
                 if input_ids.max().item() > model.module.embed_tokens.weight.shape[0]:
                     print("skipping batch")
@@ -664,11 +663,14 @@ def main(local_rank, world_size):
                         break
                     continue
                 logits = model(
-                    input_ids, attention_mask=attention_mask, return_hidden=True
+                    input_ids, attention_mask=attention_mask, cache_position=position_ids, return_hidden=True
                 )
 
-                logits = logits[:, :-1, :].reshape(-1, model.module.config.hidden_size)
-                input_ids = input_ids[:, 1:].long().reshape(-1)
+                eos_mask = (input_ids == eos_token)            
+                loss_mask = ~eos_mask[:, :-1].reshape(-1)
+
+                logits = logits[:, :-1, :].reshape(-1, model.module.config.hidden_size)[loss_mask]
+                input_ids = input_ids[:, 1:].long().reshape(-1)[loss_mask]
 
                 if USE_FAST_SOFTMAX:
                     loss = loss_fn(logits, input_ids)
