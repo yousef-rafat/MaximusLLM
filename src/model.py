@@ -247,6 +247,11 @@ class Attention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = self.compute_freq_gl(position_embeddings)
 
+        B, T = input_shape
+        if cos.shape[0] != B or cos.shape[1] != T:
+            cos = cos.view(B, T, 1, -1)
+            sin = sin.view(B, T, 1, -1)
+
         if not self.is_latent:
             query_states = self.q_proj(hidden_states).view(hidden_shape)
             key_states = self.k_proj(hidden_states).view(hidden_shape)
@@ -430,6 +435,7 @@ class Model(nn.Module):
                 past_seen_tokens + inputs_embeds.shape[1],
                 device=inputs_embeds.device,
             )
+            cache_position = cache_position.unsqueeze(0).expand(*inputs_embeds.shape[:2])
 
         if use_cache:
             seq_len = cache_position.max().item() + 1
@@ -440,10 +446,14 @@ class Model(nn.Module):
         cos_g, sin_g = self.rotary_emb._compute_cos_sin(seq_len)
         cos_l, sin_l = self.rotary_emb_local._compute_cos_sin(seq_len)
 
-        cos_g = cos_g[cache_position]
-        sin_g = sin_g[cache_position]
-        cos_l = cos_l[cache_position]
-        sin_l = sin_l[cache_position]
+        device = input_ids.device
+        def prepare_rope(t, pos):
+            return t[pos].unsqueeze(2).to(device)
+
+        cos_g = prepare_rope(cos_g, cache_position)
+        sin_g = prepare_rope(sin_g, cache_position)
+        cos_l = prepare_rope(cos_l, cache_position)
+        sin_l = prepare_rope(sin_l, cache_position)
 
         positional_embeddings = (cos_g, sin_g, cos_l, sin_l)
 

@@ -547,6 +547,7 @@ def main(local_rank, world_size):
     dtype = torch.float16
 
     dataset = HFStreamDataset(world_size=world_size, rank=local_rank)
+    eos_token = dataset.eos_token
     config = Config.from_pretrained("yousefg/MaximusLLM")
 
     config.rope_theta = ROPE_THETA
@@ -640,7 +641,6 @@ def main(local_rank, world_size):
     batch = prefetch.next()  # .next()
     running_loss = 0
     smoothed_loss = None
-    eos_token = dataset.eos_token
 
     while batch is not None:
         inputs = batch
