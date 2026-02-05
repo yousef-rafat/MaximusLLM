@@ -8,7 +8,6 @@ from datasets import load_dataset
 import torch.multiprocessing as mp
 import torch.ao.quantization as quant
 from torch.utils.data import IterableDataset
-from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
