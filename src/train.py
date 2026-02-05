@@ -29,7 +29,7 @@ except Exception:
     pass
 
 losses = []
-INDEX = 1_984 * torch.cuda.device_count()
+INDEX = 1_984
 TORCH_COMPILE = True
 USE_FAST_SOFTMAX = True
 LONG_CONTEXT_TRAINING = False
