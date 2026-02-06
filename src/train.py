@@ -322,7 +322,7 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         device = hidden_states.device
         
         sig = torch.sigmoid(logit_scale)
-        scale = 30.0 * sig + 1.0
+        scale = 100.0 * sig + 1.0
 
         h_norm_val = hidden_states.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
         h_full = hidden_states / h_norm_val
@@ -416,8 +416,8 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         
         # sigmoid derivative -> sig * (1 - sig)
         sig = torch.sigmoid(logit_scale)
-        scale = 30.0 * sig + 1.0
-        d_scale_factor = 30.0 * sig * (1.0 - sig)
+        scale = 100.0 * sig + 1.0
+        d_scale_factor = 100.0 * sig * (1.0 - sig)
         
         N, H = hidden_states.shape
         total_tokens = N
