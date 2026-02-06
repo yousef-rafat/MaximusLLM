@@ -322,7 +322,7 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         device = hidden_states.device
         
         sig = torch.sigmoid(logit_scale)
-        scale = 100.0 * sig + 1.0
+        scale = 30.0 * sig + 1.0
 
         h_norm_val = hidden_states.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
         h_full = hidden_states / h_norm_val
@@ -416,8 +416,8 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         
         # sigmoid derivative -> sig * (1 - sig)
         sig = torch.sigmoid(logit_scale)
-        scale = 100.0 * sig + 1.0
-        d_scale_factor = 100.0 * sig * (1.0 - sig)
+        scale = 30.0 * sig + 1.0
+        d_scale_factor = 30.0 * sig * (1.0 - sig)
         
         N, H = hidden_states.shape
         total_tokens = N
@@ -498,7 +498,7 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         return grad_h, grad_embed, None, grad_logit_scale, None, None, None, None, None
 
 class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
-    def __init__(self, embedding_weight, low_rank_dim=64, n_candidates=2048, chunk_size=64):
+    def __init__(self, embedding_weight, low_rank_dim=64, n_candidates=2048, chunk_size=32):
         super().__init__()
         self.embedding_weight = embedding_weight
         self.low_rank_dim = low_rank_dim
