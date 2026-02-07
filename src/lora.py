@@ -46,6 +46,28 @@ class ElongatingLoRALayer(NormalLora):
         
         return output
 
+def get_dct_orthonormal_init(rows, cols, sink_size=4, freq_sink_size=8):
+
+    i = torch.arange(rows).reshape(1, rows)
+    j = torch.arange(cols).reshape(cols, 1)
+
+    dct = torch.cos(torch.pi / cols * (j + 0.5) * i)
+
+    # normalize
+    dct[0, :] *= torch.sqrt(1.0 / cols)
+    dct[1:, :] *= torch.sqrt(2.0 / cols)
+
+    # rademacher dist. kind of (not to bias the model)
+    random_signs = torch.randint(0, 2, (1, cols)).float() * 2.0 - 1.0
+    spectral_ortho = dct * random_signs
+    
+    # boost sink tokens
+    spectral_ortho[:, :sink_size] *= 2
+
+    # boost low freq. rows
+    spectral_ortho[:freq_sink_size, :] *= 1.5 
+    return spectral_ortho
+
 class RandNLAGQALayer(nn.Module):
     def __init__(self, original_layer, sketch_size=640, topk_size=2048):
         super().__init__()
@@ -64,11 +86,10 @@ class RandNLAGQALayer(nn.Module):
         self.topk_size = topk_size
         
         #  (640, 32768)
-        self.kron_a = nn.Parameter(torch.randn(20, 128))
-        self.kron_b = nn.Parameter(torch.randn(32, 256))
+        self.kron_a = get_dct_orthonormal_init(20, 128)  #nn.Parameter(torch.randn(20, 128))
+        self.kron_b = get_dct_orthonormal_init(32, 256)  #nn.Parameter(torch.randn(32, 256))
 
-        nn.init.orthogonal_(self.kron_a)
-        nn.init.orthogonal_(self.kron_b)
+        self.sketch_scale = nn.Parameter(torch.tensor([1.0]))
 
         self.importance_scorer = nn.Sequential(
             nn.Linear(hidden_size, 64),
@@ -127,6 +148,9 @@ class RandNLAGQALayer(nn.Module):
         k_sketch = torch.matmul(k_weighted.permute(0, 2, 3, 1), P_curr.t()).permute(0, 3, 1, 2)
         v_sketch = torch.matmul(v_weighted.permute(0, 2, 3, 1), P_curr.t()).permute(0, 3, 1, 2)
 
+        k_sketch *= self.sketch_scale
+        v_sketch *= self.sketch_scale
+
         q_rope = self.target_layer.rope_fn(q, cos, sin)
         k_detail_rope = self.target_layer.rope_fn(k_detail, cos_detail, sin_detail)
 
@@ -177,6 +201,7 @@ class RandNLALatentAttention(RandNLAGQALayer):
         P_curr = self.get_p(seq_len)
 
         c_kv_sketch = torch.matmul(c_kv_weighted.transpose(1, 2), P_curr.t()).transpose(1, 2)
+        c_kv_sketch *= self.sketch_scale
 
         kv_detail = self.target_layer.kv_b(c_kv_detail)
         k_detail, v_detail = torch.chunk(kv_detail, 2, dim=-1)
