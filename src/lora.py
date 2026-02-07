@@ -47,7 +47,7 @@ class ElongatingLoRALayer(NormalLora):
         return output
 
 class RandNLAGQALayer(nn.Module):
-    def __init__(self, original_layer, sketch_size=640):
+    def __init__(self, original_layer, sketch_size=640, topk_size=2048):
         super().__init__()
         self.target_layer = original_layer
         self.max_context = 33 * 1024 
@@ -61,6 +61,7 @@ class RandNLAGQALayer(nn.Module):
         self.num_heads = original_layer.num_heads 
         self.num_kv_heads = original_layer.num_key_value_heads
         self.head_dim = original_layer.head_dim
+        self.topk_size = topk_size
         
         #  (640, 32768)
         self.kron_a = nn.Parameter(torch.randn(20, 128))
@@ -86,7 +87,7 @@ class RandNLAGQALayer(nn.Module):
             importance_logits = importance_logits - pressure_bias
 
         importance_weights = torch.sigmoid(importance_logits)
-        return importance_weights
+        return importance_weights, importance_logits
     
     def get_p(self, seq_len):
         P = torch.kron(self.kron_a, self.kron_b)
@@ -96,7 +97,7 @@ class RandNLAGQALayer(nn.Module):
         bsz, seq_len, _ = x.shape
         cos, sin = positional_emb
 
-        importance_weights = self.get_importance_weights(x)
+        importance_weights, importance_logits = self.get_importance_weights(x)
 
         q = self.target_layer.q_proj(x)
         k = self.target_layer.k_proj(x)
@@ -108,101 +109,104 @@ class RandNLAGQALayer(nn.Module):
 
         q = self.target_layer.q_norm(q)
         k = self.target_layer.k_norm(k)
+        
+        actual_topk = min(seq_len, self.topk_size)
+        _, topk_indices = torch.topk(importance_logits, actual_topk, dim=1)
+        
+        k_detail = torch.gather(k, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.num_kv_heads, self.head_dim))
+        v_detail = torch.gather(v, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.num_kv_heads, self.head_dim))
+        
+        cos_detail = torch.gather(cos, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim))
+        sin_detail = torch.gather(sin, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim))
 
         P_curr = self.get_p(seq_len)
 
-        k_weighted = k * importance_weights.unsqueeze(-1)
-        v_weighted = v * importance_weights.unsqueeze(-1)
+        k_weighted = k * importance_weights.unsqueeze(-1).unsqueeze(-1)
+        v_weighted = v * importance_weights.unsqueeze(-1).unsqueeze(-1)
 
-        k_t = k_weighted.permute(0, 2, 3, 1)
-        v_t = v_weighted.permute(0, 2, 3, 1)
-        
-        k_sketched = torch.matmul(k_t, P_curr.t())
-        v_sketched = torch.matmul(v_t, P_curr.t())
-        
-        k_final = k_sketched.permute(0, 3, 1, 2)
-        v_final = v_sketched.permute(0, 3, 1, 2)
-        
-        q_pe = self.target_layer.rope_fn(q, cos, sin)
+        k_sketch = torch.matmul(k_weighted.permute(0, 2, 3, 1), P_curr.t()).permute(0, 3, 1, 2)
+        v_sketch = torch.matmul(v_weighted.permute(0, 2, 3, 1), P_curr.t()).permute(0, 3, 1, 2)
 
-        cos_sketch = cos[:, :self.sketch_size, :, :]
-        sin_sketch = sin[:, :self.sketch_size, :, :]
-        k_pe = self.target_layer.rope_fn(k_final, cos_sketch, sin_sketch)
+        q_rope = self.target_layer.rope_fn(q, cos, sin)
+        k_detail_rope = self.target_layer.rope_fn(k_detail, cos_detail, sin_detail)
 
-        k_pe = self.repeat_kv(k_pe, self.num_heads // self.num_kv_heads)
-        v_final = self.repeat_kv(v_final, self.num_heads // self.num_kv_heads)
+        k_final = torch.cat([k_detail_rope, k_sketch], dim=1) 
+        v_final = torch.cat([v_detail, v_sketch], dim=1)
 
-        q_pe = q_pe.transpose(1, 2)
-        k_pe = k_pe.transpose(1, 2)
-        v_final = v_final.transpose(1, 2)
-        
+        k_final = torch.repeat_interleave(k_final, self.num_heads // self.num_kv_heads, dim=2)
+        v_final = torch.repeat_interleave(v_final, self.num_heads // self.num_kv_heads, dim=2)
+
         attn_output = nn.functional.scaled_dot_product_attention(
-            q_pe, k_pe, v_final, 
-            attn_mask=None, 
-            is_causal=False
+            q_rope.transpose(1, 2), k_final.transpose(1, 2), v_final.transpose(1, 2), attn_mask=None, is_causal=False
         )
 
         output = attn_output.transpose(1, 2).contiguous().reshape(bsz, seq_len, -1)
         return self.target_layer.o_proj(output)
 
-    def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-        batch, slen, num_key_value_heads, head_dim = hidden_states.shape
-        if n_rep == 1:
-            return hidden_states
-        hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
-        return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
-
 class RandNLALatentAttention(RandNLAGQALayer):
     def __init__(self, original_layer: Attention, sketch_size=640):
         super().__init__(original_layer, sketch_size)
+        self.num_key_value_heads = self.num_kv_heads
     def forward(self, x, attention_mask=None, positional_emb=None, **kwargs):
         
         bsz, seq_len, _ = x.shape
         cos, sin = positional_emb
-        importance_weights = self.get_importance_weights(x)
+        importance_weights, importance_logits = self.get_importance_weights(x)
         
         c_q = self.target_layer.q_a(x)
         c_q = self.target_layer.q_norm_latent(c_q)
         
         q = self.target_layer.q_b(c_q)
-        q = q.view(bsz, seq_len, self.target_layer.num_heads, self.target_layer.head_dim)
+        q = q.view(bsz, seq_len, self.num_heads, self.head_dim)
         
         q_pe = self.target_layer.rope_fn(q, cos, sin)
 
         c_kv = self.target_layer.kv_a(x)
         c_kv = self.target_layer.kv_norm(c_kv)
 
-        c_kv = c_kv * importance_weights
+        actual_topk = min(seq_len, self.topk_size)
+        _, topk_indices = torch.topk(importance_logits.squeeze(-1), actual_topk, dim=1)
+        
+        gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, c_kv.size(-1))
+        c_kv_detail = torch.gather(c_kv, 1, gather_idx)
+        
+        cos_detail = torch.gather(cos, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim))
+        sin_detail = torch.gather(sin, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim))
 
+        c_kv_weighted = c_kv * importance_weights
         P_curr = self.get_p(seq_len)
-        
-        c_kv_t = c_kv.transpose(1, 2)
-        c_kv_sketched = torch.matmul(c_kv_t, P_curr.t())
-        c_kv_sketched = c_kv_sketched.transpose(1, 2)
 
-        kv = self.target_layer.kv_b(c_kv_sketched)
-        
-        k, v_final = torch.chunk(kv, 2, dim=-1)
-        k = k.reshape(bsz, self.sketch_size, self.target_layer.num_key_value_heads, self.target_layer.head_dim)
-        v_final = v_final.reshape(bsz, self.sketch_size, self.target_layer.num_key_value_heads, self.target_layer.head_dim)
+        c_kv_sketch = torch.matmul(c_kv_weighted.transpose(1, 2), P_curr.t()).transpose(1, 2)
 
+        kv_detail = self.target_layer.kv_b(c_kv_detail)
+        k_detail, v_detail = torch.chunk(kv_detail, 2, dim=-1)
+        k_detail = k_detail.reshape(bsz, actual_topk, self.num_key_value_heads, self.head_dim)
+        v_detail = v_detail.reshape(bsz, actual_topk, self.num_key_value_heads, self.head_dim)
+        
+        kv_sketch = self.target_layer.kv_b(c_kv_sketch)
+        k_sketch, v_sketch = torch.chunk(kv_sketch, 2, dim=-1)
+        k_sketch = k_sketch.reshape(bsz, self.sketch_size, self.num_key_value_heads, self.head_dim)
+        v_sketch = v_sketch.reshape(bsz, self.sketch_size, self.num_key_value_heads, self.head_dim)
+        
         alpha = torch.sigmoid(self.target_layer.nope_logit)
         
+        k_detail_pe = self.target_layer.rope_fn(k_detail, cos_detail, sin_detail)
+        k_detail_final = alpha * k_detail + (1 - alpha) * k_detail_pe
+
+        # to match the energy of k_detail_final, but sketch shouldn't have rope inside of it
+        k_sketch_final = alpha * k_sketch
+
+        k_final = torch.cat([k_detail_final, k_sketch_final], dim=1)
+        v_final = torch.cat([v_detail, v_sketch], dim=1)
+
         q_final = alpha * q + (1 - alpha) * q_pe
-
-        cos_sketch = cos[:, :self.sketch_size, :, :]
-        sin_sketch = sin[:, :self.sketch_size, :, :]
         
-        k_pe = self.target_layer.rope_fn(k, cos_sketch, sin_sketch)
-        k_final = alpha * k + (1 - alpha) * k_pe
-
-        q_final = q_final.transpose(1, 2)
-        k_final = k_final.transpose(1, 2)
-        v_final = v_final.transpose(1, 2)
+        attn_output = nn.functional.scaled_dot_product_attention(
+            q_final.transpose(1, 2), k_final.transpose(1, 2), v_final.transpose(1, 2), 
+            attn_mask=None, is_causal=False
+        )
         
-        attn_output = nn.functional.scaled_dot_product_attention(q_final, k_final, v_final, attn_mask = None, is_causal=False)
         output = attn_output.transpose(1, 2).contiguous().reshape(bsz, seq_len, -1)
-        
         return self.target_layer.o_proj(output)
     
 def blockswap_attention_layers(model, sketch_size=640):
