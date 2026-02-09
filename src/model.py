@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import math
 import torch
@@ -193,7 +195,7 @@ class Attention(nn.Module):
         # init logits as identity
         if self.is_latent:
             # start with strong RoPE bias
-            self.nope_logit = nn.Parameter(torch.tensor(-5.0))
+            self.nope_logit = nn.Parameter(torch.tensor(0.0))
 
         rope_logit = 0.01
         logit = torch.log(torch.tensor(rope_logit) / (1.0 - torch.tensor(rope_logit)))
@@ -204,10 +206,9 @@ class Attention(nn.Module):
         cos_g, sin_g, cos_l, sin_l = pos_embed
         alpha = torch.sigmoid(self.rope_global_local_logit)
         alpha = alpha.view(1, 1, 1, 1)
-        rope_dim = self.head_dim // 2
 
-        cos = cos_g.view(1, -1, 1, rope_dim) * alpha + (1.0 - alpha) * cos_l.view(1, -1, 1, rope_dim)
-        sin = sin_g.view(1, -1, 1, rope_dim) * alpha + (1.0 - alpha) * sin_l.view(1, -1, 1, rope_dim)
+        cos = cos_g * alpha + cos_l * (1.0 - alpha)
+        sin = sin_g * alpha + sin_l * (1.0 - alpha)
 
         return cos, sin
 
@@ -279,7 +280,9 @@ class Attention(nn.Module):
             attention_mask = create_causal_padding_mask(
                 attention_mask, query_states.size(2), device=query_states.device, dtype=query_states.dtype
             )
-        attn_output = nn.functional.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = attention_mask, is_causal=False)
+        attn_output = nn.functional.scaled_dot_product_attention(
+            query_states, key_states, value_states, attn_mask = attention_mask, is_causal=False, scale=self.scaling
+        )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -343,7 +346,7 @@ class DecoderLayer(nn.Module):
 
 class Model(nn.Module):
 
-    def __init__(self, config, device="cpu"):
+    def __init__(self, config: Config, device="cpu"):
         super().__init__()
 
         self.config = config
@@ -352,6 +355,7 @@ class Model(nn.Module):
         self.head_dim = config.head_dim
         self.num_heads = config.num_attention_heads
 
+        self.logit_scale = torch.nn.Parameter(torch.ones([]) * 2.6592)
 
         self.embed_tokens = EmbeddingWithScale(
             config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5, device=device
@@ -438,7 +442,8 @@ class Model(nn.Module):
             cache_position = cache_position.unsqueeze(0).expand(*inputs_embeds.shape[:2])
 
         if use_cache:
-            seq_len = cache_position.max().item() + 1
+            current_max_pos = cache_position.max().item() + 1
+            seq_len = max(current_max_pos, self.config.initial_context_length)
         else:
             seq_len = input_ids.size(1)
 
@@ -446,9 +451,8 @@ class Model(nn.Module):
         cos_g, sin_g = self.rotary_emb._compute_cos_sin(seq_len)
         cos_l, sin_l = self.rotary_emb_local._compute_cos_sin(seq_len)
 
-        device = input_ids.device
         def prepare_rope(t, pos):
-            return t[pos].unsqueeze(2).to(device)
+            return t[pos].unsqueeze(2)
 
         cos_g = prepare_rope(cos_g, cache_position)
         sin_g = prepare_rope(sin_g, cache_position)

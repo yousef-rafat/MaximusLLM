@@ -322,7 +322,7 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         device = hidden_states.device
         
         sig = torch.sigmoid(logit_scale)
-        scale = 100.0 * sig + 1.0
+        scale = 30.0 * sig + 1.0
 
         h_norm_val = hidden_states.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
         h_full = hidden_states / h_norm_val
@@ -416,8 +416,8 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         
         # sigmoid derivative -> sig * (1 - sig)
         sig = torch.sigmoid(logit_scale)
-        scale = 100.0 * sig + 1.0
-        d_scale_factor = 100.0 * sig * (1.0 - sig)
+        scale = 30.0 * sig + 1.0
+        d_scale_factor = 30.0 * sig * (1.0 - sig)
         
         N, H = hidden_states.shape
         total_tokens = N
@@ -434,12 +434,12 @@ class MatryoshkaManualFunction(torch.autograd.Function):
             
             # index 0 = label
             # CE gradient = (softmax - label)
-            dz_m = p_m
+            dz_m = p_m.clone()
             dz_m[:, 0] -= 1.0
 
             dz_m = dz_m * (grad_output / total_tokens) * scale
             
-            dz_a = p_a
+            dz_a = p_a.clone()
             dz_a[:, 0] -= 1.0
             dz_a = dz_a * (grad_output / total_tokens) * scale * aux_weight
 
@@ -498,13 +498,13 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         return grad_h, grad_embed, None, grad_logit_scale, None, None, None, None, None
 
 class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
-    def __init__(self, embedding_weight, low_rank_dim=64, n_candidates=2048, chunk_size=32):
+    def __init__(self, embedding_weight, logit_scale, low_rank_dim=64, n_candidates=2048, chunk_size=32):
         super().__init__()
         self.embedding_weight = embedding_weight
         self.low_rank_dim = low_rank_dim
         self.n_candidates = n_candidates
         self.chunk_size = chunk_size
-        self.logit_scale = torch.nn.Parameter(torch.ones([]) * 2.6592)
+        self.logit_scale = logit_scale
 
     def forward(self, hidden_states, target_ids, with_batch_mean=True):
         return MatryoshkaManualFunction.apply(
@@ -608,7 +608,7 @@ def main(local_rank, world_size):
     if not USE_FAST_SOFTMAX:
         loss_fn = LigerFusedLinearCrossEntropyLoss()
     else:
-        loss_fn = MatryoshkaSampledSoftmaxLoss(model.embed_tokens.weight)
+        loss_fn = MatryoshkaSampledSoftmaxLoss(model.embed_tokens.weight, model.logit_scale)
 
     model.train()
     if TORCH_COMPILE:
