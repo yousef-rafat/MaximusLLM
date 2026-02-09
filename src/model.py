@@ -192,10 +192,9 @@ class Attention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias, device=device
         )
 
-        # init logits as identity
         if self.is_latent:
             # start with strong RoPE bias
-            self.nope_logit = nn.Parameter(torch.tensor(0.0))
+            self.nope_logit = nn.Parameter(torch.tensor(-2.0))
 
         rope_logit = 0.01
         logit = torch.log(torch.tensor(rope_logit) / (1.0 - torch.tensor(rope_logit)))

@@ -141,7 +141,8 @@ def analyze_model(model, tokenizer, config):
 
     with torch.no_grad():
         final_out = model(input_ids, attention_mask=None, return_hidden=True)
-        if isinstance(final_out, tuple): final_out = final_out[0]
+        if isinstance(final_out, tuple):
+            final_out = final_out[0]
 
     print(f"{'Layer':<10} | {'Mean':<10} | {'Std':<10} | {'Max':<10}")
     for i in range(len(model.layers)):
