@@ -354,8 +354,6 @@ class Model(nn.Module):
         self.head_dim = config.head_dim
         self.num_heads = config.num_attention_heads
 
-        self.logit_scale = torch.nn.Parameter(torch.ones([]) * 2.6592)
-
         self.embed_tokens = EmbeddingWithScale(
             config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5, device=device
         )
