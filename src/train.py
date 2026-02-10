@@ -62,7 +62,7 @@ def lr_scheduler_fn(optimizer, min_lr=0.1):
 
 class Settings:
     weight_decay = 0.05
-    batch_size = 12
+    batch_size = 8
     muon_lr = 0.002
     adamw_rate = 4e-4
     use_adamw_only = False
@@ -321,7 +321,7 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         
         N, _ = hidden_states.shape
         device = hidden_states.device
-        dtype = hidden_states.dtype # Capture original dtype (e.g. float16)
+        dtype = hidden_states.dtype
         
         scale = Settings.matryoshka_scale
 
