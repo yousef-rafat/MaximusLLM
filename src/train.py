@@ -350,7 +350,7 @@ class MatryoshkaManualFunction(torch.autograd.Function):
                 k_per_scout = n_candidates // (chunk_size // stride)
                 _, top_indices = torch.topk(scan_logits, k_per_scout, dim=1)
                 
-                top_indices = top_indices.reshape(-1).unique()
+                top_indices = top_indices.reshape(-1)
 
             w_f_pos = F.normalize(embedding_weight[curr_t_ids], p=2, dim=-1)
             w_f_cand = F.normalize(embedding_weight[top_indices], p=2, dim=-1)
