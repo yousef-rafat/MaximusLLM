@@ -448,7 +448,7 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         dot = (grad_h_norm * h_f_total).sum(dim=-1, keepdim=True)
         grad_h = (grad_h_norm - h_f_total * dot) / h_norm_val.float()
  
-        return grad_h.to(dtype), grad_embed.to(dtype), None, None, None, None, None, None
+        return grad_h.to(dtype), grad_embed.to(dtype), None, None, None, None, None
 
 class MatryoshkaSampledSoftmaxLoss(torch.nn.Module):
     def __init__(self, embedding_weight, low_rank_dim=64, n_candidates=2048, chunk_size=32):
