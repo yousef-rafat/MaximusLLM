@@ -1,6 +1,5 @@
 import os
 import torch
-import random
 import fnmatch
 from model import Model, Config
 import torch.distributed as dist
@@ -18,6 +17,7 @@ from itertools import islice
 import torch.nn.functional as F
 from huggingface_hub import list_repo_files
 from utils import update_model_hf, get_global_loss, get_raw_model
+from lora import blockswap_attention_layers
 
 from transformers.utils import logging
 logging.set_verbosity_error()
@@ -262,7 +262,7 @@ class HFStreamDataset(IterableDataset):
         for item in ds_iterator:
             tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
 
-            if PACKING:
+            if PACKING and not LONG_CONTEXT_TRAINING:
                 tokens.append(self.eos_token)
                 buffer.extend(tokens)
 
@@ -276,19 +276,24 @@ class HFStreamDataset(IterableDataset):
                         batch = []
             
             elif LONG_CONTEXT_TRAINING:
-                if len(tokens) > MAX_LENGTH:
-                    start = random.randint(0, len(tokens) - (MAX_LENGTH - 1))
-                    tokens = tokens[start : start + (MAX_LENGTH - 1)]
-                    seq = tokens + [self.eos_token]
-                    batch.append(seq)
-                else:
-                    buffer.extend(tokens)
-                    if buffer:
-                        buffer.append(self.eos_token)
-                    while len(buffer) >= MAX_LENGTH:
-                        seq = buffer[:MAX_LENGTH]
-                        buffer = buffer[MAX_LENGTH:]
-                        batch.append(seq)
+                full_document_tokens = tokens + [self.eos_token]
+                for j in range(0, len(full_document_tokens), MAX_LENGTH):
+                    chunk = full_document_tokens[j : j + MAX_LENGTH]
+                    if len(chunk) < MAX_LENGTH:
+                        buffer.extend(chunk)
+                        
+                        while len(buffer) >= MAX_LENGTH:
+                            batch.append(torch.tensor(buffer[:MAX_LENGTH], dtype=torch.long))
+                            buffer = buffer[MAX_LENGTH:]
+                            if len(batch) == Settings.batch_size:
+                                yield from return_batch(batch)
+                                batch = []
+                    else:
+                        batch.append(torch.tensor(chunk, dtype=torch.long))
+                        
+                        if len(batch) == Settings.batch_size:
+                            yield from return_batch(batch)
+                            batch = []
             else:
                 tokens = tokens[: MAX_LENGTH - 2]
                 tokens += [self.eos_token]
@@ -501,10 +506,14 @@ def main(local_rank, world_size):
 
     config.rope_theta = ROPE_THETA
     config.context_length = MAX_LENGTH
-    config.use_lora = LONG_CONTEXT_TRAINING
+    config.use_yarn = LONG_CONTEXT_TRAINING
 
     # for muons stability, we init the model to fp32
     model = Model(config, device).float()
+
+    if LONG_CONTEXT_TRAINING:
+        model = blockswap_attention_layers(model)
+
     model.to(device)
     dataset = torch.utils.data.DataLoader(
         dataset, num_workers = 4, prefetch_factor = 2, batch_size=None, pin_memory = True

@@ -528,7 +528,7 @@ class Config(Gemma3TextConfig):
         self.kv_lora_rank = 64
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.base = 10_000
-        self.initial_context_length = 2048
+        self.initial_context_length = 4096
         self.fast_beta = 32
         self.slow_beta = 1
         self.use_yarn = False # for long context training only
