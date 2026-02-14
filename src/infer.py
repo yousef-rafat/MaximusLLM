@@ -48,10 +48,19 @@ def general_generate_fn(model, inputs, tokenizer, max_new_tokens = 50, temperatu
 
     for i in range(max_new_tokens):
         current_inputs = inputs if i == 0 else sample
+        seq_len = generated_ids.shape[1]
+        input_len = current_inputs.shape[1]
+        position_ids = torch.arange(seq_len - input_len, seq_len, device=device).unsqueeze(0)
+
+        if i == 0: 
+            mask = torch.ones_like(current_inputs, dtype=torch.bool)
+        else:
+            mask = torch.ones((inputs.shape[0], 1), dtype=torch.bool, device=device)
 
         logits, past_key_values = model(current_inputs,
-                       attention_mask = torch.ones_like(current_inputs), use_cache = True,
-                       past_key_values=past_key_values, return_hidden=True)
+                                        attention_mask = mask, use_cache = True,
+                                        past_key_values=past_key_values, return_hidden=True,
+                                        cache_position=position_ids)
 
         new_logit = logits[:, -1]
         # normalization needed
