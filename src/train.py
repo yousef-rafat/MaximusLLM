@@ -1,5 +1,6 @@
 import os
 import torch
+import random
 import fnmatch
 from model import Model, Config
 import torch.distributed as dist
@@ -69,6 +70,7 @@ class Settings:
     aux_loss_percent = 0.2
     loss_ema_beta = 0.95
     matryoshka_scale = 20.0
+    random_slice_prob = 0.3
 
 
 class CUDAPreFetch:
@@ -259,6 +261,18 @@ class HFStreamDataset(IterableDataset):
         if self.rows_to_skip > 0:
             ds_iterator = islice(ds_iterator, self.rows_to_skip, None)
 
+        def do_pack():
+            nonlocal batch
+            while len(buffer) >= MAX_LENGTH:
+                seq = buffer[:MAX_LENGTH]
+                del buffer[:MAX_LENGTH]
+                batch.append(torch.tensor(seq, dtype=torch.long))
+
+                if len(batch) == Settings.batch_size:
+                    yield from return_batch(batch)
+                    batch = []
+
+
         for item in ds_iterator:
             tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
 
@@ -266,34 +280,43 @@ class HFStreamDataset(IterableDataset):
                 tokens.append(self.eos_token)
                 buffer.extend(tokens)
 
-                while len(buffer) >= MAX_LENGTH:
-                    seq = buffer[:MAX_LENGTH]
-                    buffer = buffer[MAX_LENGTH:]
-                    batch.append(torch.tensor(seq, dtype=torch.long))
-
-                    if len(batch) == Settings.batch_size:
-                        yield from return_batch(batch)
-                        batch = []
+                yield from do_pack()
             
             elif LONG_CONTEXT_TRAINING:
-                full_document_tokens = tokens + [self.eos_token]
-                for j in range(0, len(full_document_tokens), MAX_LENGTH):
-                    chunk = full_document_tokens[j : j + MAX_LENGTH]
-                    if len(chunk) < MAX_LENGTH:
-                        buffer.extend(chunk)
+                # we mix between random slicing of bigger than 32k-length data and pushing full 32k samples
+                # the rest variable length samples gets to buffer with packing logic
+                full_tokens = tokens + [self.eos_token]
+                doc_len = len(full_tokens)
+
+                if doc_len > MAX_LENGTH:
+                    roll = random.random()
+                    
+                    # random 32k window from a large document
+                    if roll < Settings.random_slice_prob:
+                        start = random.randint(0, doc_len - MAX_LENGTH)
+                        segment = full_tokens[start : start + MAX_LENGTH]
                         
-                        while len(buffer) >= MAX_LENGTH:
-                            batch.append(torch.tensor(buffer[:MAX_LENGTH], dtype=torch.long))
-                            buffer = buffer[MAX_LENGTH:]
-                            if len(batch) == Settings.batch_size:
-                                yield from return_batch(batch)
-                                batch = []
-                    else:
-                        batch.append(torch.tensor(chunk, dtype=torch.long))
-                        
+                        batch.append(torch.tensor(segment, dtype=torch.long))
                         if len(batch) == Settings.batch_size:
                             yield from return_batch(batch)
                             batch = []
+
+                    else:
+                        for j in range(0, doc_len, MAX_LENGTH):
+                            chunk = full_tokens[j : j + MAX_LENGTH]
+                            
+                            if len(chunk) == MAX_LENGTH:
+                                batch.append(torch.tensor(chunk, dtype=torch.long))
+                                if len(batch) == Settings.batch_size:
+                                    yield from return_batch(batch)
+                                    batch = []
+                            else:
+                                buffer.extend(chunk)
+
+                else:
+                    buffer.extend(full_tokens)
+
+                yield from do_pack()
             else:
                 tokens = tokens[: MAX_LENGTH - 2]
                 tokens += [self.eos_token]
