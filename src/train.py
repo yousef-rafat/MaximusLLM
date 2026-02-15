@@ -153,7 +153,7 @@ def get_packed_mask_and_pos_ids(input_ids, eos_token_id):
 class HFStreamDataset(IterableDataset):
     def __init__(
         self,
-        dataset_name: str = "HuggingFaceFW/fineweb",
+        dataset_name: str = "HuggingFaceFW/fineweb-edu",
         subset = "CC-MAIN-2024-10",
         take=None,
         rank=0,
