@@ -71,6 +71,7 @@ class Settings:
     loss_ema_beta = 0.95
     matryoshka_scale = 20.0
     random_slice_prob = 0.3
+    SFT_TRAINING=False
 
 
 class CUDAPreFetch:
@@ -647,8 +648,13 @@ def main(local_rank, world_size):
                     input_ids, attention_mask=attention_mask, cache_position=position_ids, return_hidden=True
                 )
 
-                eos_mask = (input_ids == eos_token)            
-                loss_mask = ~eos_mask[:, :-1].reshape(-1)
+                eos_mask = (input_ids == eos_token)
+                if Settings.SFT_TRAINING:
+                    # TODO lables for sft training
+                    sft_mask = (input_ids[:, 1:] != -100).long().reshape(-1)
+                    loss_mask = (~eos_mask[:, :-1].reshape(-1)) & sft_mask
+                else:
+                    loss_mask = ~eos_mask[:, :-1].reshape(-1)
 
                 logits = logits[:, :-1, :].reshape(-1, model.module.config.hidden_size)[loss_mask]
                 input_ids = input_ids[:, 1:].long().reshape(-1)[loss_mask]
