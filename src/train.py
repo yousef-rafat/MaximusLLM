@@ -255,10 +255,14 @@ class HFStreamDataset(IterableDataset):
             print(f"[Worker {global_worker_id}] Using fallback sharding for {self.dataset_name}")
             ds = load_dataset(self.dataset_name, name=self.subset, split="train", streaming=True, trust_remote_code=True)
             
-            ds = ds.shard(num_shards=global_num_workers, index=global_worker_id)
+            ds_iterator = iter(ds)
+            ds_iterator = islice(ds_iterator, global_worker_id, None, global_num_workers)
 
-            total_rows_to_skip = (self.tokens_processed) // global_num_workers
-            ds_iterator = iter(ds.skip(total_rows_to_skip))
+            total_docs_processed = INDEX * Settings.batch_size * ACCUM_STEPS * self.world_size
+            rows_per_worker_to_skip = total_docs_processed // global_num_workers
+            
+            if rows_per_worker_to_skip > 0:
+                ds_iterator = islice(ds_iterator, rows_per_worker_to_skip, None)
 
         buffer = []
         batch = []

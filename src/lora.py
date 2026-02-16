@@ -69,7 +69,7 @@ def get_dct_orthonormal_init(rows, cols, sink_size=4, freq_sink_size=8):
     return spectral_ortho
 
 class RandNLAGQALayer(nn.Module):
-    def __init__(self, original_layer, sketch_size=640, topk_size=2048):
+    def __init__(self, original_layer: Attention, sketch_size=640, topk_size=2048):
         super().__init__()
         self.target_layer = original_layer
         self.max_context = 33 * 1024 
@@ -114,9 +114,10 @@ class RandNLAGQALayer(nn.Module):
         P = torch.kron(self.kron_a, self.kron_b)
         return P[:, :seq_len]
 
-    def forward(self, x, attention_mask=None, positional_emb=None, **kwargs):
+    def forward(self, hidden_states, attention_mask=None, positional_embeddings=None, **kwargs):
+        x = hidden_states
         bsz, seq_len, _ = x.shape
-        cos, sin = positional_emb
+        cos, sin = self.target_layer.compute_freq_gl(positional_embeddings)
 
         importance_weights, importance_logits = self.get_importance_weights(x)
 
@@ -171,10 +172,10 @@ class RandNLALatentAttention(RandNLAGQALayer):
     def __init__(self, original_layer: Attention, sketch_size=640):
         super().__init__(original_layer, sketch_size)
         self.num_key_value_heads = self.num_kv_heads
-    def forward(self, x, attention_mask=None, positional_emb=None, **kwargs):
-        
+    def forward(self, hidden_states, attention_mask=None, positional_embeddings=None, **kwargs):
+        x = hidden_states
         bsz, seq_len, _ = x.shape
-        cos, sin = positional_emb
+        cos, sin = self.target_layer.compute_freq_gl(positional_embeddings)
         importance_weights, importance_logits = self.get_importance_weights(x)
         
         c_q = self.target_layer.q_a(x)
