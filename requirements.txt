@@ -1,7 +1,7 @@
 torch>=2.90
 transformers
-huggingface_hub
+huggingface_hub==0.19.4
 safetensors
-liger_kernel
-datasets
+# liger_kernel
+datasets==2.15.0
 matplotlib # optional

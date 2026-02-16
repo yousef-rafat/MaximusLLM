@@ -1,7 +1,6 @@
 import os
 import torch
 import random
-import fnmatch
 from model import Model, Config
 import torch.distributed as dist
 from datasets import load_dataset
@@ -29,11 +28,11 @@ except Exception:
     pass
 
 losses = []
-INDEX = 1_984
+INDEX = 0
 TORCH_COMPILE = True
 USE_FAST_SOFTMAX = True
-LONG_CONTEXT_TRAINING = False
-MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 32768
+LONG_CONTEXT_TRAINING = True
+MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 8192#32768
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
 SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
@@ -154,16 +153,14 @@ def get_packed_mask_and_pos_ids(input_ids, eos_token_id):
 class HFStreamDataset(IterableDataset):
     def __init__(
         self,
-        dataset_name: str = "HuggingFaceFW/fineweb-edu",
-        subset = "CC-MAIN-2024-10",
-        take=None,
+        dataset_name: str = "Lyun0912/LongABC",
+        subset = "default",
         rank=0,
         world_size=1,
         files_to_skip=0
     ):
         self.dataset_name = dataset_name
         self.subset = subset
-        self.take = take
         self.rank = rank
         self.world_size = world_size
         self.files_to_skip = files_to_skip
@@ -175,6 +172,7 @@ class HFStreamDataset(IterableDataset):
         self.ROWS_PER_FILE_EST = 300_000 
 
         tokens_processed = INDEX * Settings.batch_size * world_size * MAX_LENGTH
+        self.tokens_processed = tokens_processed
 
         tokens_per_worker = tokens_processed / world_size
         
@@ -192,16 +190,19 @@ class HFStreamDataset(IterableDataset):
             print(f"Skipping first {self.rows_to_skip} rows in the active file.")
 
         try:
-            all_repo_files = sorted(list_repo_files(
+            all_repo_files = list_repo_files(
                 dataset_name, 
                 repo_type="dataset",
                 token=None
-            ))
+            )
 
-            filter_pattern = f"data/{subset}/*.parquet"
-            self.all_files = sorted([
-                f for f in all_repo_files if fnmatch.fnmatch(f, filter_pattern)
-            ])
+            self.all_files = []
+            for f in all_repo_files:
+                if f.endswith(".parquet") and (subset in f):
+                    self.all_files.append(f)
+            
+            self.all_files = sorted(self.all_files)
+
             self.all_file_urls = [
                 f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{f}" 
                 for f in self.all_files
@@ -223,30 +224,41 @@ class HFStreamDataset(IterableDataset):
         global_worker_id = (self.rank * num_workers) + worker_id
 
         # we shard the file urls between multiple workers
-        my_urls = self.all_file_urls[global_worker_id::global_num_workers]
+        if len(self.all_file_urls) > 0:
+            my_urls = self.all_file_urls[global_worker_id::global_num_workers]
 
-        if self.files_per_worker_skipped > 0:
-            if self.files_per_worker_skipped < len(my_urls):
-                my_urls = my_urls[self.files_per_worker_skipped:]
-            else:
-                print(f"[Rank {self.rank}] Worker {worker_id} has finished all assigned files.")
+            if self.files_per_worker_skipped > 0:
+                if self.files_per_worker_skipped < len(my_urls):
+                    my_urls = my_urls[self.files_per_worker_skipped:]
+                else:
+                    print(f"[Rank {self.rank}] Worker {worker_id} has finished all assigned files.")
+                    return
+
+            if not my_urls:
+                print(f"[Rank {self.rank} Worker {worker_id}] No files left to process.")
                 return
 
-        if not my_urls:
-            print(f"[Rank {self.rank} Worker {worker_id}] No files left to process.")
-            return
+            print(f"[Rank {self.rank} Worker {worker_id}] Streaming {len(my_urls)} files...")
 
-        print(f"[Rank {self.rank} Worker {worker_id}] Streaming {len(my_urls)} files...")
+            ds = load_dataset(
+                "parquet", 
+                data_files=my_urls, 
+                split="train", 
+                streaming=True
+            )
 
-        ds = load_dataset(
-            "parquet", 
-            data_files=my_urls, 
-            split="train", 
-            streaming=True
-        )
+            ds_iterator = iter(ds)
+            if self.rows_to_skip > 0:
+                ds_iterator = islice(ds_iterator, self.rows_to_skip, None)
 
-        if self.take:
-            ds = ds.take(self.take)
+        else:
+            print(f"[Worker {global_worker_id}] Using fallback sharding for {self.dataset_name}")
+            ds = load_dataset(self.dataset_name, name=self.subset, split="train", streaming=True, trust_remote_code=True)
+            
+            ds = ds.shard(num_shards=global_num_workers, index=global_worker_id)
+
+            total_rows_to_skip = (self.tokens_processed) // global_num_workers
+            ds_iterator = iter(ds.skip(total_rows_to_skip))
 
         buffer = []
         batch = []
@@ -258,9 +270,6 @@ class HFStreamDataset(IterableDataset):
                 b = torch.tensor(batch, dtype=torch.long)
             yield b 
 
-        ds_iterator = iter(ds)
-        if self.rows_to_skip > 0:
-            ds_iterator = islice(ds_iterator, self.rows_to_skip, None)
 
         def do_pack():
             nonlocal batch
@@ -273,9 +282,8 @@ class HFStreamDataset(IterableDataset):
                     yield from return_batch(batch)
                     batch = []
 
-
         for item in ds_iterator:
-            tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
+            tokens = self.tokenizer(item["content"], add_special_tokens=False)["input_ids"]
 
             if PACKING and not LONG_CONTEXT_TRAINING:
                 tokens.append(self.eos_token)
@@ -529,14 +537,14 @@ def main(local_rank, world_size):
     config = Config.from_pretrained("yousefg/MaximusLLM")
 
     config.rope_theta = ROPE_THETA
-    config.context_length = MAX_LENGTH
+    config.initial_context_length = MAX_LENGTH
     config.use_yarn = LONG_CONTEXT_TRAINING
 
     # for muons stability, we init the model to fp32
     model = Model(config, device).float()
 
     if LONG_CONTEXT_TRAINING:
-        model = blockswap_attention_layers(model)
+        blockswap_attention_layers(model)
 
     model.to(device)
     dataset = torch.utils.data.DataLoader(
@@ -563,7 +571,6 @@ def main(local_rank, world_size):
 
     scaler = torch.amp.GradScaler(enabled=True)
 
-
     if os.path.exists("model.safetensors"):
         try:
             checkpoint = torch.load("model.safetensors")
@@ -585,7 +592,7 @@ def main(local_rank, world_size):
             else:
                 new_key = key
             new_state_dict[new_key] = value
-        model.load_state_dict(new_state_dict, strict=False)
+        model.load_state_dict(new_state_dict, strict=True)
         del new_state_dict, checkpoint
     
     if not USE_FAST_SOFTMAX:

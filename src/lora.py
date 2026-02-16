@@ -54,12 +54,12 @@ def get_dct_orthonormal_init(rows, cols, sink_size=4, freq_sink_size=8):
     dct = torch.cos(torch.pi / cols * (j + 0.5) * i)
 
     # normalize
-    dct[0, :] *= torch.sqrt(1.0 / cols)
-    dct[1:, :] *= torch.sqrt(2.0 / cols)
+    dct[0, :] *= math.sqrt(1.0 / cols)
+    dct[1:, :] *= math.sqrt(2.0 / cols)
 
     # rademacher dist. kind of (not to bias the model)
     random_signs = torch.randint(0, 2, (1, cols)).float() * 2.0 - 1.0
-    spectral_ortho = dct * random_signs
+    spectral_ortho = torch.matmul(random_signs, dct)
     
     # boost sink tokens
     spectral_ortho[:, :sink_size] *= 2
@@ -89,7 +89,7 @@ class RandNLAGQALayer(nn.Module):
         self.kron_a = get_dct_orthonormal_init(20, 128)  #nn.Parameter(torch.randn(20, 128))
         self.kron_b = get_dct_orthonormal_init(32, 256)  #nn.Parameter(torch.randn(32, 256))
 
-        self.sketch_scale = nn.Parameter(torch.tensor([1.0]))
+        self.sketch_scale = nn.Parameter(torch.tensor([0.1]))
 
         self.importance_scorer = nn.Sequential(
             nn.Linear(hidden_size, 64),
