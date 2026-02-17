@@ -59,17 +59,17 @@ def get_dct_orthonormal_init(rows, cols, sink_size=4, freq_sink_size=8):
 
     # rademacher dist. kind of (not to bias the model)
     random_signs = torch.randint(0, 2, (1, cols)).float() * 2.0 - 1.0
-    spectral_ortho = torch.matmul(random_signs, dct)
+    spectral_ortho = dct * random_signs
     
     # boost sink tokens
-    spectral_ortho[:, :sink_size] *= 2
+    spectral_ortho[:, :sink_size] *= 2.0
 
     # boost low freq. rows
     spectral_ortho[:freq_sink_size, :] *= 1.5 
     return spectral_ortho
 
 class RandNLAGQALayer(nn.Module):
-    def __init__(self, original_layer: Attention, sketch_size=640, topk_size=2048):
+    def __init__(self, original_layer: Attention, sketch_size=640, topk_size=1024):
         super().__init__()
         self.target_layer = original_layer
         self.max_context = 33 * 1024 
@@ -135,16 +135,21 @@ class RandNLAGQALayer(nn.Module):
         actual_topk = min(seq_len, self.topk_size)
         _, topk_indices = torch.topk(importance_logits, actual_topk, dim=1)
         
-        k_detail = torch.gather(k, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.num_kv_heads, self.head_dim))
-        v_detail = torch.gather(v, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.num_kv_heads, self.head_dim))
+        gather_idx = topk_indices.view(bsz, actual_topk, 1, 1).expand(-1, -1, self.num_kv_heads, self.head_dim)
         
-        cos_detail = torch.gather(cos, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, cos.shape[-1]))
-        sin_detail = torch.gather(sin, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, cos.shape[-1]))
+        k_detail = torch.gather(k, 1, gather_idx)
+        v_detail = torch.gather(v, 1, gather_idx)
+
+        rope_dim = cos.shape[-1]
+        rope_gather_idx = topk_indices.view(bsz, actual_topk, 1, 1).expand(-1, -1, 1, rope_dim)
+        
+        cos_detail = torch.gather(cos, 1, rope_gather_idx)
+        sin_detail = torch.gather(sin, 1, rope_gather_idx)
 
         P_curr = self.get_p(seq_len).to(q.device)
 
-        k_weighted = k * importance_weights.unsqueeze(-1).unsqueeze(-1)
-        v_weighted = v * importance_weights.unsqueeze(-1).unsqueeze(-1)
+        k_weighted = k * importance_weights.unsqueeze(-1)
+        v_weighted = v * importance_weights.unsqueeze(-1)
 
         k_sketch = torch.matmul(k_weighted.permute(0, 2, 3, 1), P_curr.t()).permute(0, 3, 1, 2)
         v_sketch = torch.matmul(v_weighted.permute(0, 2, 3, 1), P_curr.t()).permute(0, 3, 1, 2)
@@ -201,7 +206,7 @@ class RandNLALatentAttention(RandNLAGQALayer):
         c_kv_weighted = c_kv * importance_weights
         P_curr = self.get_p(seq_len).to(c_kv_weighted.device)
 
-        c_kv_sketch = torch.matmul(c_kv_weighted.transpose(1, 2), P_curr)
+        c_kv_sketch = torch.matmul(c_kv_weighted.transpose(1, 2), P_curr.t()).transpose(1, 2)
         c_kv_sketch *= self.sketch_scale
 
         kv_detail = self.target_layer.kv_b(c_kv_detail)

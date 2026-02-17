@@ -32,8 +32,8 @@ INDEX = 0
 TORCH_COMPILE = True
 USE_FAST_SOFTMAX = True
 LONG_CONTEXT_TRAINING = True
-MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 8192#32768
-ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 1_500_000
+MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 8192
+ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 100_000
 SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
 ACCUM_STEPS = 21
@@ -153,8 +153,8 @@ def get_packed_mask_and_pos_ids(input_ids, eos_token_id):
 class HFStreamDataset(IterableDataset):
     def __init__(
         self,
-        dataset_name: str = "Lyun0912/LongABC",
-        subset = "default",
+        dataset_name: str = "HuggingFaceTB/smollm-corpus",
+        subset = "cosmopedia-v2",
         rank=0,
         world_size=1,
         files_to_skip=0
@@ -224,45 +224,31 @@ class HFStreamDataset(IterableDataset):
         global_worker_id = (self.rank * num_workers) + worker_id
 
         # we shard the file urls between multiple workers
-        if len(self.all_file_urls) > 0:
-            my_urls = self.all_file_urls[global_worker_id::global_num_workers]
+        my_urls = self.all_file_urls[global_worker_id::global_num_workers]
 
-            if self.files_per_worker_skipped > 0:
-                if self.files_per_worker_skipped < len(my_urls):
-                    my_urls = my_urls[self.files_per_worker_skipped:]
-                else:
-                    print(f"[Rank {self.rank}] Worker {worker_id} has finished all assigned files.")
-                    return
-
-            if not my_urls:
-                print(f"[Rank {self.rank} Worker {worker_id}] No files left to process.")
+        if self.files_per_worker_skipped > 0:
+            if self.files_per_worker_skipped < len(my_urls):
+                my_urls = my_urls[self.files_per_worker_skipped:]
+            else:
+                print(f"[Rank {self.rank}] Worker {worker_id} has finished all assigned files.")
                 return
 
-            print(f"[Rank {self.rank} Worker {worker_id}] Streaming {len(my_urls)} files...")
+        if not my_urls:
+            print(f"[Rank {self.rank} Worker {worker_id}] No files left to process.")
+            return
 
-            ds = load_dataset(
-                "parquet", 
-                data_files=my_urls, 
-                split="train", 
-                streaming=True
-            )
+        print(f"[Rank {self.rank} Worker {worker_id}] Streaming {len(my_urls)} files...")
 
-            ds_iterator = iter(ds)
-            if self.rows_to_skip > 0:
-                ds_iterator = islice(ds_iterator, self.rows_to_skip, None)
+        ds = load_dataset(
+            "parquet", 
+            data_files=my_urls, 
+            split="train", 
+            streaming=True
+        )
 
-        else:
-            print(f"[Worker {global_worker_id}] Using fallback sharding for {self.dataset_name}")
-            ds = load_dataset(self.dataset_name, name=self.subset, split="train", streaming=True, trust_remote_code=True)
-            
-            ds_iterator = iter(ds)
-            ds_iterator = islice(ds_iterator, global_worker_id, None, global_num_workers)
-
-            total_docs_processed = INDEX * Settings.batch_size * ACCUM_STEPS * self.world_size
-            rows_per_worker_to_skip = total_docs_processed // global_num_workers
-            
-            if rows_per_worker_to_skip > 0:
-                ds_iterator = islice(ds_iterator, rows_per_worker_to_skip, None)
+        ds_iterator = iter(ds)
+        if self.rows_to_skip > 0:
+            ds_iterator = islice(ds_iterator, self.rows_to_skip, None)
 
         buffer = []
         batch = []
@@ -287,7 +273,7 @@ class HFStreamDataset(IterableDataset):
                     batch = []
 
         for item in ds_iterator:
-            tokens = self.tokenizer(item["content"], add_special_tokens=False)["input_ids"]
+            tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
 
             if PACKING and not LONG_CONTEXT_TRAINING:
                 tokens.append(self.eos_token)
