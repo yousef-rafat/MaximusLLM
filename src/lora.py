@@ -48,8 +48,8 @@ class ElongatingLoRALayer(NormalLora):
 
 def get_dct_orthonormal_init(rows, cols, sink_size=4, freq_sink_size=8):
 
-    i = torch.arange(rows).reshape(1, rows)
-    j = torch.arange(cols).reshape(cols, 1)
+    i = torch.arange(rows).reshape(rows, 1)
+    j = torch.arange(cols).reshape(1, cols)
 
     dct = torch.cos(torch.pi / cols * (j + 0.5) * i)
 
@@ -114,10 +114,10 @@ class RandNLAGQALayer(nn.Module):
         P = torch.kron(self.kron_a, self.kron_b)
         return P[:, :seq_len]
 
-    def forward(self, hidden_states, attention_mask=None, positional_embeddings=None, **kwargs):
+    def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
         x = hidden_states
         bsz, seq_len, _ = x.shape
-        cos, sin = self.target_layer.compute_freq_gl(positional_embeddings)
+        cos, sin = self.target_layer.compute_freq_gl(position_embeddings)
 
         importance_weights, importance_logits = self.get_importance_weights(x)
 
@@ -138,10 +138,10 @@ class RandNLAGQALayer(nn.Module):
         k_detail = torch.gather(k, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.num_kv_heads, self.head_dim))
         v_detail = torch.gather(v, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.num_kv_heads, self.head_dim))
         
-        cos_detail = torch.gather(cos, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim))
-        sin_detail = torch.gather(sin, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim))
+        cos_detail = torch.gather(cos, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, cos.shape[-1]))
+        sin_detail = torch.gather(sin, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, cos.shape[-1]))
 
-        P_curr = self.get_p(seq_len)
+        P_curr = self.get_p(seq_len).to(q.device)
 
         k_weighted = k * importance_weights.unsqueeze(-1).unsqueeze(-1)
         v_weighted = v * importance_weights.unsqueeze(-1).unsqueeze(-1)
@@ -172,10 +172,10 @@ class RandNLALatentAttention(RandNLAGQALayer):
     def __init__(self, original_layer: Attention, sketch_size=640):
         super().__init__(original_layer, sketch_size)
         self.num_key_value_heads = self.num_kv_heads
-    def forward(self, hidden_states, attention_mask=None, positional_embeddings=None, **kwargs):
+    def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
         x = hidden_states
         bsz, seq_len, _ = x.shape
-        cos, sin = self.target_layer.compute_freq_gl(positional_embeddings)
+        cos, sin = self.target_layer.compute_freq_gl(position_embeddings)
         importance_weights, importance_logits = self.get_importance_weights(x)
         
         c_q = self.target_layer.q_a(x)
@@ -195,13 +195,13 @@ class RandNLALatentAttention(RandNLAGQALayer):
         gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, c_kv.size(-1))
         c_kv_detail = torch.gather(c_kv, 1, gather_idx)
         
-        cos_detail = torch.gather(cos, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim))
-        sin_detail = torch.gather(sin, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.head_dim))
+        cos_detail = torch.gather(cos, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, cos.shape[-1]))
+        sin_detail = torch.gather(sin, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, cos.shape[-1]))
 
         c_kv_weighted = c_kv * importance_weights
-        P_curr = self.get_p(seq_len)
+        P_curr = self.get_p(seq_len).to(c_kv_weighted.device)
 
-        c_kv_sketch = torch.matmul(c_kv_weighted.transpose(1, 2), P_curr.t()).transpose(1, 2)
+        c_kv_sketch = torch.matmul(c_kv_weighted.transpose(1, 2), P_curr)
         c_kv_sketch *= self.sketch_scale
 
         kv_detail = self.target_layer.kv_b(c_kv_detail)
