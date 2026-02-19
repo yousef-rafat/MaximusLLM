@@ -253,29 +253,58 @@ class HFStreamDataset(IterableDataset):
         buffer = []
         batch = []
 
-        def return_batch(batch):
+        batch_labels = []
+        buffer_labels = []
+
+        def return_batch(batch, labels=None):
             if isinstance(batch, list):
-                b = torch.stack(batch)
+                if labels is None:
+                    b = torch.stack(batch)
+                else:
+                    b = (torch.stack(batch), torch.stack(labels))
             else:
-                b = torch.tensor(batch, dtype=torch.long)
+                if labels is None:
+                    b = torch.tensor(batch, dtype=torch.long)
+                else:
+                    b = (torch.tensor(batch, dtype=torch.long), torch.tensor(labels, dtype=torch.long))
             yield b 
 
 
         def do_pack():
-            nonlocal batch
+            nonlocal batch, batch_labels
             while len(buffer) >= MAX_LENGTH:
                 seq = buffer[:MAX_LENGTH]
+
                 del buffer[:MAX_LENGTH]
                 batch.append(torch.tensor(seq, dtype=torch.long))
 
+                if Settings.SFT_TRAINING:
+                    labels = buffer_labels[:MAX_LENGTH]
+                    del buffer_labels[:MAX_LENGTH]
+                    batch_labels.append(torch.tensor(labels, dtype=torch.long))
+
                 if len(batch) == Settings.batch_size:
-                    yield from return_batch(batch)
-                    batch = []
+                    if Settings.SFT_TRAINING:
+                        yield from return_batch(batch, batch_labels)
+                        batch, batch_labels = [], []
+                    else:
+                        yield from return_batch(batch)
+                        batch = []
 
         for item in ds_iterator:
-            tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
+            if Settings.SFT_TRAINING:
+                tokens = self.tokenizer(item["prompt"], add_special_tokens=False)["input_ids"]
+                labels = self.tokenizer(item[1]["content"], add_special_tokens=False)["input_ids"]
+            else:
+                tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
 
             if PACKING and not LONG_CONTEXT_TRAINING:
+                if Settings.SFT_TRAINING:
+                    full_tokens = tokens + labels
+                    labels = (len(tokens) * [-100]) + labels + [self.eos_token]
+                    buffer_labels.extend(labels)
+                    tokens = full_tokens
+
                 tokens.append(self.eos_token)
                 buffer.extend(tokens)
 
@@ -631,8 +660,14 @@ def main(local_rank, world_size):
         with sync_context:
             with torch.amp.autocast(
                 enabled=True, device_type=f"cuda:{local_rank}", dtype=dtype
-            ):
-                input_ids = inputs
+            ):  
+                if Settings.SFT_TRAINING:
+                    input_ids, lables = inputs
+                else:
+                    # pretraining + long context training
+                    input_ids = inputs
+                    labels = input_ids
+
                 attention_mask, position_ids = get_packed_mask_and_pos_ids(input_ids, eos_token)
                 # safety
                 if input_ids.max().item() > model.module.embed_tokens.weight.shape[0]:
@@ -647,22 +682,21 @@ def main(local_rank, world_size):
 
                 eos_mask = (input_ids == eos_token)
                 if Settings.SFT_TRAINING:
-                    # TODO lables for sft training
-                    sft_mask = (input_ids[:, 1:] != -100).long().reshape(-1)
+                    sft_mask = (labels[:, 1:] != -100).long().reshape(-1)
                     loss_mask = (~eos_mask[:, :-1].reshape(-1)) & sft_mask
                 else:
                     loss_mask = ~eos_mask[:, :-1].reshape(-1)
 
                 logits = logits[:, :-1, :].reshape(-1, model.module.config.hidden_size)[loss_mask]
-                input_ids = input_ids[:, 1:].long().reshape(-1)[loss_mask]
+                labels = labels[:, 1:].long().reshape(-1)[loss_mask]
 
                 if USE_FAST_SOFTMAX:
-                    loss = loss_fn(logits, input_ids)
+                    loss = loss_fn(logits, labels)
                 else:
                     loss = loss_fn(
                         model.module.lm_head.weight,
                         logits,
-                        input_ids,
+                        labels,
                     )
 
                 loss = loss / ACCUM_STEPS
