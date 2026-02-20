@@ -210,11 +210,15 @@ class RandNLAGQALayer(nn.Module):
         out_sketch_reshaped = out_sketch.view(bsz, self.sketch_size, self.num_heads, self.head_dim).permute(0, 2, 3, 1)
         output_full = self.apply_expand(out_sketch_reshaped, seq_len)
         
-        output_full_at_topk = torch.gather(output_full, 1, topk_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)))
+        output_full = output_full.permute(0, 3, 1, 2).flatten(2)
+        gather_dim = output_full.size(-1) 
+        gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, gather_dim)
+        
+        output_full_at_topk = torch.gather(output_full, 1, gather_idx)
 
         E = out_det - output_full_at_topk
         
-        output_full.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)), E)
+        output_full.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, gather_dim), E)
 
         return self.target_layer.o_proj(output_full)
 
@@ -305,7 +309,7 @@ class RandNLALatentAttention(RandNLAGQALayer):
         output_full_at_topk = batch_gather(output_full, topk_indices)
 
         E = out_det - output_full_at_topk
-        output_full.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)), E)
+        output_full.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, output_full.size(-1)), E)
 
         return self.target_layer.o_proj(output_full)
     

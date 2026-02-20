@@ -56,6 +56,19 @@ class MLP(nn.Module):
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
+        if self.training and x.shape[1] > 1024:
+            chunks = torch.split(x, 1024, dim=1)
+            outputs = []
+            
+            for chunk in chunks:
+                def compute_mlp(hidden_chunk):
+                    return self.down_proj(self.act_fn(self.gate_proj(hidden_chunk)) * self.up_proj(hidden_chunk))
+
+                out = torch.utils.checkpoint.checkpoint(compute_mlp, chunk, use_reentrant=False)
+                outputs.append(out)
+                
+            return torch.cat(outputs, dim=1)
+        
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
