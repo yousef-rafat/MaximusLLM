@@ -1,7 +1,8 @@
 import torch
-import torch.nn as nn
 import math
+import torch.nn as nn
 from model import Attention
+import torch.nn.functional as F
 
 # query, key -> ElongatingLoRALayer
 # value, out -> NormalLora
@@ -97,6 +98,36 @@ class RandNLAGQALayer(nn.Module):
             nn.Linear(64, 1)
         )
 
+    # use the kronecker product identity to save on computing the full P matrix
+    def apply_sketch(self, x):
+        B, H, D, T = x.shape
+        
+        # 128 * 256
+        target_len = self.kron_a.shape[-1] * self.kron_b.shape[-1]
+        if T < target_len:
+            x = F.pad(x, (0, target_len - T))
+        
+        x = x.view(B, H, D, 128, 256)
+        
+        x = torch.matmul(x, self.kron_b.t())
+        x = x.transpose(-1, -2)
+        x = torch.matmul(x, self.kron_a.t())
+        
+        return x.flatten(-2)
+
+    def apply_expand(self, x, original_len):
+        B, H, D, S = x.shape
+        
+        x = x.view(B, H, D, 32, 20)
+        
+        x = torch.matmul(x, self.kron_a)
+        x = x.transpose(-1, -2)
+        x = torch.matmul(x, self.kron_b)
+        
+        x = x.flatten(-2)
+        
+        return x[..., :original_len]
+
     def get_importance_weights(self, x):
         _, seq_len, _ = x.shape
         importance_logits = self.importance_scorer(x)
@@ -109,10 +140,6 @@ class RandNLAGQALayer(nn.Module):
 
         importance_weights = torch.sigmoid(importance_logits)
         return importance_weights, importance_logits
-    
-    def get_p(self, seq_len):
-        P = torch.kron(self.kron_a, self.kron_b)
-        return P[:, :seq_len]
 
     def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
         x = hidden_states
@@ -148,14 +175,12 @@ class RandNLAGQALayer(nn.Module):
             
         cos_detail = batch_gather_rope(cos, topk_indices)
         sin_detail = batch_gather_rope(sin, topk_indices)
-
-        P_curr = self.get_p(seq_len).to(x.device)
         
         rest_weights = importance_weights * is_rest.unsqueeze(-1).float()
         
         def sketch_tensor(tensor, weights):
             t = (tensor * weights.unsqueeze(-1)).permute(0, 2, 3, 1)
-            return torch.matmul(t, P_curr.t()).permute(0, 3, 1, 2)
+            return self.apply_sketch(t).permute(0, 3, 1, 2)
 
         q_sketch = sketch_tensor(q, importance_weights)
         k_sketch = sketch_tensor(k, rest_weights)
@@ -182,7 +207,8 @@ class RandNLAGQALayer(nn.Module):
         out_det = attn_output[:, :actual_topk].flatten(2)
         out_sketch = attn_output[:, actual_topk:].flatten(2)
 
-        output_full = torch.matmul(out_sketch.transpose(1, 2), P_curr).transpose(1, 2)
+        out_sketch_reshaped = out_sketch.view(bsz, self.sketch_size, self.num_heads, self.head_dim).permute(0, 2, 3, 1)
+        output_full = self.apply_expand(out_sketch_reshaped, seq_len)
         
         output_full_at_topk = torch.gather(output_full, 1, topk_indices.unsqueeze(-1).expand(-1, -1, x.size(-1)))
 
@@ -221,10 +247,11 @@ class RandNLALatentAttention(RandNLAGQALayer):
         
         rest_weights = importance_weights * is_rest.unsqueeze(-1).float()
         
-        P = self.get_p(seq_len).to(x.device)
+        c_q_in = (c_q * importance_weights).permute(0, 2, 1).unsqueeze(1)
+        c_kv_in = (c_kv * rest_weights).permute(0, 2, 1).unsqueeze(1)
         
-        q_rest_sketch_lat = torch.matmul(c_q.transpose(1, 2), rest_weights * P.t()).transpose(1, 2)
-        kv_rest_sketch_lat = torch.matmul(c_kv.transpose(1, 2), rest_weights * P.t()).transpose(1, 2)
+        q_rest_sketch_lat = self.apply_sketch(c_q_in).squeeze(1).transpose(1, 2)
+        kv_rest_sketch_lat = self.apply_sketch(c_kv_in).squeeze(1).transpose(1, 2)
 
         combined_lat_q = torch.cat([q_det_lat, q_rest_sketch_lat], dim=1)
         combined_lat_kv = torch.cat([kv_det_lat, kv_rest_sketch_lat], dim=1)
@@ -235,8 +262,11 @@ class RandNLALatentAttention(RandNLAGQALayer):
         k_all = k_all.view(bsz, -1, self.num_kv_heads, self.head_dim)
         v_all = v_all.view(bsz, -1, self.num_kv_heads, self.head_dim)
 
-        cos_det = batch_gather(cos, topk_indices).unsqueeze(2)
-        sin_det = batch_gather(sin, topk_indices).unsqueeze(2)
+        def batch_gather_rope(tensor, indices):
+            return torch.gather(tensor, 1, indices.view(bsz, actual_topk, 1, 1).expand(-1, -1, 1, tensor.shape[-1]))
+
+        cos_det = batch_gather_rope(cos, topk_indices)
+        sin_det = batch_gather_rope(sin, topk_indices)
         
         alpha = torch.sigmoid(self.target_layer.nope_logit)
         
@@ -269,7 +299,9 @@ class RandNLALatentAttention(RandNLAGQALayer):
         out_det = attn_out[:, :actual_topk].flatten(2)
         out_sketch = attn_out[:, actual_topk:].flatten(2)
 
-        output_full = torch.matmul(out_sketch.transpose(1, 2), P).transpose(1, 2)
+        out_sketch_reshaped = out_sketch.view(bsz, self.sketch_size, self.num_heads, self.head_dim).permute(0, 2, 3, 1)
+        output_full = self.apply_expand(out_sketch_reshaped, seq_len).permute(0, 3, 1, 2).flatten(2)
+
         output_full_at_topk = batch_gather(output_full, topk_indices)
 
         E = out_det - output_full_at_topk
