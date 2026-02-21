@@ -473,6 +473,11 @@ class MatryoshkaManualFunction(torch.autograd.Function):
 
         for i, chunk in enumerate(ctx.saved_chunks):
             (h_f, t_ids, top_idx, p_m, p_a, w_fp, w_fc, w_lp, w_lc, l_m, l_a) = chunk
+
+            w_fp = w_fp.to(dtype)
+            w_fc = w_fc.to(dtype)
+            w_lp = w_lp.to(dtype)
+            w_lc = w_lc.to(dtype)
             
             # index 0 = label
             # CE gradient = (softmax - label)
@@ -495,6 +500,7 @@ class MatryoshkaManualFunction(torch.autograd.Function):
 
             h_f_float = h_f.float()
             grad_embed.index_add_(0, t_ids, dz_m[:, :1] * h_f_float)
+            h_f = h_f.to(dtype)
             
             grad_embed.index_add_(0, top_idx, torch.matmul(dz_m_dt[:, 1:].t(), h_f).float())
 
@@ -623,13 +629,13 @@ def main(local_rank, world_size):
 
     model.train()
     if TORCH_COMPILE:
-        model = model.to(device)
+        model = model.to(device).to(dtype)
         #model = torch.compile(model, fullgraph=True, mode="default")
         # avoid problems with custom autograd fn and compiling
         for i, block in enumerate(model.layers):
             model.layers[i] = torch.compile(block, mode="default", fullgraph=True)
     else:
-        model = model.to(device)
+        model = model.to(device).to(dtype)
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
@@ -758,7 +764,7 @@ def main(local_rank, world_size):
             running_loss = 0
             
 
-        del input_ids, attention_mask, logits, loss
+        del input_ids, attention_mask, logits, loss, labels
 
         batch = next_batch
         step += 1

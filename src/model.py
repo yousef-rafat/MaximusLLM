@@ -7,6 +7,15 @@ import torch.nn as nn
 from transformers import DynamicCache, Gemma3TextConfig, AutoModelForCausalLM
 from fisher_svd import svd_init_latent, compute_fisher_importance, model_id, token
 
+try:
+    from liger_kernel.transformers import LigerRMSNorm
+    def RMSNorm(dim, eps, device):
+        return LigerRMSNorm(dim, eps)
+except ImportError:
+    from torch.nn import RMSNorm as torchRMSNORM
+    def RMSNorm(dim, eps, device):
+        return torchRMSNORM(dim, eps, device=device)
+
 def create_causal_padding_mask(attention_mask, seq_len, dtype, device):
 
     if dtype == torch.float16:
@@ -63,29 +72,13 @@ class MLP(nn.Module):
             for chunk in chunks:
                 def compute_mlp(hidden_chunk):
                     return self.down_proj(self.act_fn(self.gate_proj(hidden_chunk)) * self.up_proj(hidden_chunk))
-
-                out = torch.utils.checkpoint.checkpoint(compute_mlp, chunk, use_reentrant=False)
+                out = compute_mlp(chunk)
                 outputs.append(out)
                 
             return torch.cat(outputs, dim=1)
-        
+
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, device=None):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim, device=device))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float())
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
 
 def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     x1, x2 = torch.chunk(x, 2, dim=-1)

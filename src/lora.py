@@ -147,7 +147,7 @@ class RandNLAGQALayer(nn.Module):
         for chunk in chunks:
             def compute_proj(c):
                 return self.target_layer.o_proj(c)
-            out = torch.utils.checkpoint.checkpoint(compute_proj, chunk, use_reentrant=False)
+            out = compute_proj(chunk)
             results.append(out)
         return torch.cat(results, dim=1)
 
@@ -228,7 +228,7 @@ class RandNLAGQALayer(nn.Module):
 
         E = out_det - output_full_at_topk
         
-        output_full.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, gather_dim), E)
+        output_full = output_full.scatter_add(1, topk_indices.unsqueeze(-1).expand(-1, -1, gather_dim), E)
 
         if self.training and seq_len > 2048:
             return self.compute_efficient_oproj(output_full)
@@ -322,7 +322,7 @@ class RandNLALatentAttention(RandNLAGQALayer):
         output_full_at_topk = batch_gather(output_full, topk_indices)
 
         E = out_det - output_full_at_topk
-        output_full.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, output_full.size(-1)), E)
+        output_full = output_full.scatter_add(1, topk_indices.unsqueeze(-1).expand(-1, -1, output_full.size(-1)), E)
 
         if self.training and seq_len > 2048:
             return self.compute_efficient_oproj(output_full)
