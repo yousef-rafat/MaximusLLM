@@ -140,6 +140,16 @@ class RandNLAGQALayer(nn.Module):
 
         importance_weights = torch.sigmoid(importance_logits)
         return importance_weights, importance_logits
+    
+    def compute_efficient_oproj(self, output_full):
+        chunks = torch.split(output_full, 1024, dim=1)
+        results = []
+        for chunk in chunks:
+            def compute_proj(c):
+                return self.target_layer.o_proj(c)
+            out = torch.utils.checkpoint.checkpoint(compute_proj, chunk, use_reentrant=False)
+            results.append(out)
+        return torch.cat(results, dim=1)
 
     def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
         x = hidden_states
@@ -220,7 +230,10 @@ class RandNLAGQALayer(nn.Module):
         
         output_full.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, gather_dim), E)
 
-        return self.target_layer.o_proj(output_full)
+        if self.training and seq_len > 2048:
+            return self.compute_efficient_oproj(output_full)
+        else: 
+            return self.target_layer.o_proj(output_full)
 
 class RandNLALatentAttention(RandNLAGQALayer):
     def __init__(self, original_layer: Attention, sketch_size=640):
@@ -311,7 +324,10 @@ class RandNLALatentAttention(RandNLAGQALayer):
         E = out_det - output_full_at_topk
         output_full.scatter_add_(1, topk_indices.unsqueeze(-1).expand(-1, -1, output_full.size(-1)), E)
 
-        return self.target_layer.o_proj(output_full)
+        if self.training and seq_len > 2048:
+            return self.compute_efficient_oproj(output_full)
+        else: 
+            return self.target_layer.o_proj(output_full)
     
 def blockswap_attention_layers(model, sketch_size=640):
     for layer in model.layers:
