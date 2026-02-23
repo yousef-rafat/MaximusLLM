@@ -572,6 +572,7 @@ def main(local_rank, world_size):
 
     if LONG_CONTEXT_TRAINING:
         blockswap_attention_layers(model)
+        model.use_custom_ckpt_fn = True
 
     model.to(device)
     dataset = torch.utils.data.DataLoader(
@@ -643,6 +644,7 @@ def main(local_rank, world_size):
         device_ids=[local_rank],
         find_unused_parameters=False,
         bucket_cap_mb=100,
+        static_graph=False
     )
 
     # quantization

@@ -4,6 +4,7 @@ import copy
 import math
 import torch
 import torch.nn as nn
+from functools import partial
 from transformers import DynamicCache, Gemma3TextConfig, AutoModelForCausalLM
 from fisher_svd import svd_init_latent, compute_fisher_importance, model_id, token
 
@@ -68,13 +69,9 @@ class MLP(nn.Module):
         if self.training and x.shape[1] > 1024:
             chunks = torch.split(x, 1024, dim=1)
             outputs = []
-            
             for chunk in chunks:
-                def compute_mlp(hidden_chunk):
-                    return self.down_proj(self.act_fn(self.gate_proj(hidden_chunk)) * self.up_proj(hidden_chunk))
-                out = compute_mlp(chunk)
+                out = self.down_proj(self.act_fn(self.gate_proj(chunk)) * self.up_proj(chunk))
                 outputs.append(out)
-                
             return torch.cat(outputs, dim=1)
 
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -349,6 +346,43 @@ class DecoderLayer(nn.Module):
 
         return outputs
 
+
+class RandNLACheckpointer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, run_fn, hidden_states):
+        ctx.run_fn = run_fn
+        ctx.save_for_backward(hidden_states)
+        
+        ctx.cpu_rng = torch.get_rng_state()
+        ctx.cuda_rng = torch.cuda.get_rng_state()
+        
+        ctx.autocast_enabled = torch.is_autocast_enabled("cuda")
+        ctx.autocast_dtype = torch.get_autocast_gpu_dtype()
+
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=ctx.autocast_enabled, dtype=ctx.autocast_dtype):
+            output = run_fn(hidden_states)
+            
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden_states, = ctx.saved_tensors
+        run_fn = ctx.run_fn
+
+        torch.set_rng_state(ctx.cpu_rng)
+        torch.cuda.set_rng_state(ctx.cuda_rng)
+
+        hidden_states = hidden_states.detach().requires_grad_(True)
+
+        with torch.enable_grad(), torch.amp.autocast("cuda", enabled=ctx.autocast_enabled, dtype=ctx.autocast_dtype):
+            output = run_fn(hidden_states)
+
+        torch.autograd.backward(output, grad_output)
+        return None, hidden_states.grad
+
+def apply_custom_checkpointer(fn, x):
+    return RandNLACheckpointer.apply(fn, x)
+
 class Model(nn.Module):
 
     def __init__(self, config: Config, device="cpu"):
@@ -375,6 +409,7 @@ class Model(nn.Module):
         #self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, device="meta")
         #self.lm_head.weight = self.embed_tokens.weight
         self.gradient_checkpointing = False
+        self.use_custom_ckpt_fn = False
 
     def init_latent_attention(self, num_batches=100):
         model = AutoModelForCausalLM.from_pretrained(
@@ -474,10 +509,16 @@ class Model(nn.Module):
             "cache_position":cache_position,
             **kwargs
         }
+
+        if self.use_custom_ckpt_fn:
+            ckpt_fn = apply_custom_checkpointer
+        else:
+            ckpt_fn = partial(torch.utils.checkpoint.checkpoint, use_reentrant = False)
+
         for i, decoder_layer in enumerate(self.layers[: num_layers]):
             
             if self.gradient_checkpointing and self.training:
-                hidden_states = torch.utils.checkpoint.checkpoint(decoder_layer, hidden_states=hidden_states, **model_args, use_reentrant = False)
+                hidden_states = ckpt_fn(lambda h: decoder_layer(h, **model_args), hidden_states)
             else:
                 hidden_states = decoder_layer(hidden_states=hidden_states, **model_args)
 

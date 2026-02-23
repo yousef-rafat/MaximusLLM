@@ -145,10 +145,7 @@ class RandNLAGQALayer(nn.Module):
         chunks = torch.split(output_full, 1024, dim=1)
         results = []
         for chunk in chunks:
-            def compute_proj(c):
-                return self.target_layer.o_proj(c)
-            out = compute_proj(chunk)
-            results.append(out)
+            results.append(self.target_layer.o_proj(chunk))
         return torch.cat(results, dim=1)
 
     def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
