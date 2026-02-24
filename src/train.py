@@ -583,19 +583,6 @@ def main(local_rank, world_size):
     prefetch.async_load()
     model.gradient_checkpointing = True
 
-    param_groups = filter_ckpt_for_muon(model, Settings.weight_decay)
-
-    adamw_groups = [param_groups[0]] 
-    muon_groups = [param_groups[1]]
-
-    if not Settings.use_adamw_only:
-        main_optimizer = torch.optim.Muon(muon_groups, lr=Settings.muon_lr)
-        muon_scheduler = lr_scheduler_fn(main_optimizer)
-    else:
-        adamw_groups += muon_groups
-
-    second_optimizer = torch.optim.AdamW(adamw_groups, lr=Settings.adamw_rate)
-    adam_scheduler = lr_scheduler_fn(second_optimizer)
 
     scaler = torch.amp.GradScaler(enabled=True)
 
@@ -623,6 +610,20 @@ def main(local_rank, world_size):
         model.load_state_dict(new_state_dict, strict=True)
         del new_state_dict, checkpoint
     
+    param_groups = filter_ckpt_for_muon(model, Settings.weight_decay)
+
+    adamw_groups = [param_groups[0]] 
+    muon_groups = [param_groups[1]]
+
+    if not Settings.use_adamw_only:
+        main_optimizer = torch.optim.Muon(muon_groups, lr=Settings.muon_lr)
+        muon_scheduler = lr_scheduler_fn(main_optimizer)
+    else:
+        adamw_groups += muon_groups
+
+    second_optimizer = torch.optim.AdamW(adamw_groups, lr=Settings.adamw_rate)
+    adam_scheduler = lr_scheduler_fn(second_optimizer)
+
     if not USE_FAST_SOFTMAX:
         loss_fn = LigerFusedLinearCrossEntropyLoss()
     else:
