@@ -267,6 +267,9 @@ class RandNLALatentAttention(RandNLAGQALayer):
         q_rest_sketch_lat = self.apply_sketch(c_q_in).squeeze(1).transpose(1, 2)
         kv_rest_sketch_lat = self.apply_sketch(c_kv_in).squeeze(1).transpose(1, 2)
 
+        q_rest_sketch_lat *= self.sketch_scale
+        kv_rest_sketch_lat *= self.sketch_scale
+
         combined_lat_q = torch.cat([q_det_lat, q_rest_sketch_lat], dim=1)
         combined_lat_kv = torch.cat([kv_det_lat, kv_rest_sketch_lat], dim=1)
 

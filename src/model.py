@@ -345,13 +345,14 @@ class DecoderLayer(nn.Module):
         outputs = hidden_states
 
         return outputs
-
-
+  
+# better name?
 class RandNLACheckpointer(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, run_fn, hidden_states):
+    def forward(ctx, run_fn, hidden_states, *params):
         ctx.run_fn = run_fn
         ctx.save_for_backward(hidden_states)
+        ctx.params = params
         
         ctx.cpu_rng = torch.get_rng_state()
         ctx.cuda_rng = torch.cuda.get_rng_state()
@@ -368,6 +369,7 @@ class RandNLACheckpointer(torch.autograd.Function):
     def backward(ctx, grad_output):
         hidden_states, = ctx.saved_tensors
         run_fn = ctx.run_fn
+        params = ctx.params
 
         torch.set_rng_state(ctx.cpu_rng)
         torch.cuda.set_rng_state(ctx.cuda_rng)
@@ -377,11 +379,25 @@ class RandNLACheckpointer(torch.autograd.Function):
         with torch.enable_grad(), torch.amp.autocast("cuda", enabled=ctx.autocast_enabled, dtype=ctx.autocast_dtype):
             output = run_fn(hidden_states)
 
-        torch.autograd.backward(output, grad_output)
-        return None, hidden_states.grad
+            # an issue with ddp that inspired this custom checkpointer
+            tensors_to_compute = [hidden_states] + list(params)
+            
+            grads = torch.autograd.grad(
+                outputs=output,
+                inputs=tensors_to_compute,
+                grad_outputs=grad_output,
+                allow_unused=True
+            )
 
-def apply_custom_checkpointer(fn, x):
-    return RandNLACheckpointer.apply(fn, x)
+        grad_hidden = grads[0]
+        grad_params = grads[1:]
+
+        return (None, grad_hidden, *grad_params)
+
+def apply_custom_checkpointer(module, hidden_states, **kwargs):
+    run_fn = partial(module.__call__, **kwargs)
+    params = [p for p in module.parameters() if p.requires_grad]    
+    return RandNLACheckpointer.apply(run_fn, hidden_states, *params)
 
 class Model(nn.Module):
 
@@ -518,7 +534,7 @@ class Model(nn.Module):
         for i, decoder_layer in enumerate(self.layers[: num_layers]):
             
             if self.gradient_checkpointing and self.training:
-                hidden_states = ckpt_fn(lambda h: decoder_layer(h, **model_args), hidden_states)
+                hidden_states = ckpt_fn(decoder_layer, hidden_states, **model_args)
             else:
                 hidden_states = decoder_layer(hidden_states=hidden_states, **model_args)
 

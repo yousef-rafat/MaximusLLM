@@ -64,7 +64,7 @@ def lr_scheduler_fn(optimizer, min_lr=0.1):
 
 class Settings:
     weight_decay = 0.05
-    batch_size = 8
+    batch_size = 2
     muon_lr = 0.002
     adamw_rate = 4e-4
     use_adamw_only = False
@@ -610,6 +610,8 @@ def main(local_rank, world_size):
         model.load_state_dict(new_state_dict, strict=True)
         del new_state_dict, checkpoint
     
+    model.float()
+    
     param_groups = filter_ckpt_for_muon(model, Settings.weight_decay)
 
     adamw_groups = [param_groups[0]] 
@@ -631,13 +633,13 @@ def main(local_rank, world_size):
 
     model.train()
     if TORCH_COMPILE:
-        model = model.to(device).to(dtype)
+        model = model.to(device)
         #model = torch.compile(model, fullgraph=True, mode="default")
         # avoid problems with custom autograd fn and compiling
         for i, block in enumerate(model.layers):
             model.layers[i] = torch.compile(block, mode="default", fullgraph=True)
     else:
-        model = model.to(device).to(dtype)
+        model = model.to(device)
 
     model = torch.nn.parallel.DistributedDataParallel(
         model,
