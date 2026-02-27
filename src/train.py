@@ -414,6 +414,8 @@ class MatryoshkaManualFunction(torch.autograd.Function):
             w_f_cand = F.normalize(embedding_weight[top_indices], p=2, dim=-1)
             
             pos_sims = (curr_h_f * w_f_pos).sum(dim=-1, keepdim=True)
+            margin = 0.1
+            pos_sims = pos_sims - margin
             
             neg_sims = torch.matmul(curr_h_f, w_f_cand.t())
             

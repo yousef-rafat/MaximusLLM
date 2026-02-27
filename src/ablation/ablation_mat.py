@@ -1,3 +1,4 @@
+import copy
 import json
 import torch
 import torch.nn as nn
@@ -21,11 +22,16 @@ config.num_attention_heads = 6
 config.head_dim = 64
 config.vocab_size = 262144
 
-SAMPLES_TO_TRAIN = 4000
+STEPS = 4000
 BATCH_SIZE = 8
-SEQ_LEN = 512 
+SEQ_LEN = 512
 DEVICE = "cuda"
-EVAL_INTERVAL = 25
+EVAL_INTERVAL = 100
+
+SCALE_FIX = config.hidden_size ** 0.5
+
+model_base = Model(config, DEVICE).to(torch.float16)
+model_maxis = copy.deepcopy(model_base)
 
 torch.set_default_dtype(torch.float32)
 
@@ -55,7 +61,7 @@ def get_next_batch():
 
 if "val_buffer" not in globals():
     val_buffer = [get_next_batch() for _ in range(20)]
-    train_buffer = [get_next_batch() for _ in range(SAMPLES_TO_TRAIN // BATCH_SIZE)]
+    train_buffer = [get_next_batch() for _ in range(STEPS // BATCH_SIZE)]
 
 print(f">>> Loaded {len(train_buffer)} Training Batches.")
 
@@ -90,7 +96,7 @@ def run_experiment(name, loss_type):
     torch.cuda.empty_cache()
     
     accumulated_train_time = 0.0
-    
+    embed = torch.nn.functional.normalize(model.embed_tokens)
     for step, inputs in enumerate(train_buffer):
         inputs = inputs.to(device=DEVICE, dtype=torch.long, non_blocking=True)
         
@@ -104,7 +110,7 @@ def run_experiment(name, loss_type):
             t_shift = inputs[:, 1:].reshape(-1)
         
             if loss_type == "liger":
-                loss = train_fn(model.embed_tokens.weight, h_shift, t_shift)
+                loss = train_fn(model.embed_tokens.weight, h_shift / SCALE_FIX, t_shift)
             else:
                 loss = train_fn(h_shift, t_shift)
             
@@ -122,7 +128,7 @@ def run_experiment(name, loss_type):
                     with torch.amp.autocast(device_type="cuda", enabled=False):
                         v_h = model(v_in, attention_mask=None, return_hidden=True)
                     
-                        logits = torch.matmul(v_h, model.embed_tokens.weight.t())
+                        logits = torch.matmul(torch.nn.functional.normaliz(v_h), embed.t())
                     
                         l_shift = logits[:, :-1, :].reshape(-1, config.vocab_size)
                         vt_shift = v_in[:, 1:].reshape(-1)
