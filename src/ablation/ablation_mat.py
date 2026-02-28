@@ -1,4 +1,3 @@
-import copy
 import json
 import torch
 import torch.nn as nn
@@ -22,16 +21,11 @@ config.num_attention_heads = 6
 config.head_dim = 64
 config.vocab_size = 262144
 
-STEPS = 4000
+SAMPLES_TO_TRAIN = 4000
 BATCH_SIZE = 8
-SEQ_LEN = 512
+SEQ_LEN = 512 
 DEVICE = "cuda"
-EVAL_INTERVAL = 100
-
-SCALE_FIX = config.hidden_size ** 0.5
-
-model_base = Model(config, DEVICE).to(torch.float16)
-model_maxis = copy.deepcopy(model_base)
+EVAL_INTERVAL = 25
 
 torch.set_default_dtype(torch.float32)
 
@@ -61,7 +55,7 @@ def get_next_batch():
 
 if "val_buffer" not in globals():
     val_buffer = [get_next_batch() for _ in range(20)]
-    train_buffer = [get_next_batch() for _ in range(STEPS // BATCH_SIZE)]
+    train_buffer = [get_next_batch() for _ in range(SAMPLES_TO_TRAIN // BATCH_SIZE)]
 
 print(f">>> Loaded {len(train_buffer)} Training Batches.")
 
@@ -96,7 +90,7 @@ def run_experiment(name, loss_type):
     torch.cuda.empty_cache()
     
     accumulated_train_time = 0.0
-    embed = torch.nn.functional.normalize(model.embed_tokens)
+    
     for step, inputs in enumerate(train_buffer):
         inputs = inputs.to(device=DEVICE, dtype=torch.long, non_blocking=True)
         
@@ -110,7 +104,7 @@ def run_experiment(name, loss_type):
             t_shift = inputs[:, 1:].reshape(-1)
         
             if loss_type == "liger":
-                loss = train_fn(model.embed_tokens.weight, h_shift / SCALE_FIX, t_shift)
+                loss = train_fn(model.embed_tokens.weight, h_shift, t_shift)
             else:
                 loss = train_fn(h_shift, t_shift)
             
@@ -120,21 +114,23 @@ def run_experiment(name, loss_type):
         accumulated_train_time += (time.time() - t0)
         
         if step % EVAL_INTERVAL == 0 or step == len(train_buffer) - 1:
+            del hidden, h_shift
+            del inputs
             model.eval()
             total_val_loss = 0
             with torch.no_grad():
                 for v_in in val_buffer:
                     v_in = v_in.to(DEVICE, dtype=torch.long, non_blocking=True)
-                    with torch.amp.autocast(device_type="cuda", enabled=False):
+                    with torch.amp.autocast(device_type="cuda", enabled=True, dtype=torch.float16):
                         v_h = model(v_in, attention_mask=None, return_hidden=True)
-                    
-                        logits = torch.matmul(torch.nn.functional.normaliz(v_h), embed.t())
+                        logits = torch.matmul(v_h, model.embed_tokens.weight.t())
                     
                         l_shift = logits[:, :-1, :].reshape(-1, config.vocab_size)
                         vt_shift = v_in[:, 1:].reshape(-1)
-                    
-                        v_loss = val_fn(l_shift.float(), vt_shift)
-                        total_val_loss += v_loss.item()
+                    del v_in
+                    del v_h
+                    v_loss = val_fn(l_shift, vt_shift)
+                    total_val_loss += v_loss.item()
             
             avg_val_loss = total_val_loss / len(val_buffer)
             print(f"Step {step} | Train Time: {accumulated_train_time:.1f}s | Val Loss: {avg_val_loss:.4f}")
@@ -159,7 +155,7 @@ def plot_results():
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     
     ax1.plot(time_l, val_l, label='Standard CE (Liger)', marker='o', color='gray')
-    ax1.plot(time_m, val_m, label='MAXIS (Yours)', marker='s', color='blue', linewidth=2)
+    ax1.plot(time_m, val_m, label='MAXIS (Ours)', marker='s', color='blue', linewidth=2)
     ax1.set_title("Intelligence per Second\n(Lower & Left is Better)")
     ax1.set_xlabel("Training Time (Seconds)")
     ax1.set_ylabel("Validation Loss (True CE)")
