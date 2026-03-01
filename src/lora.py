@@ -90,7 +90,20 @@ class RandNLAGQALayer(nn.Module):
         self.kron_a = nn.Parameter(get_dct_orthonormal_init(20, 128))
         self.kron_b = nn.Parameter(get_dct_orthonormal_init(32, 256))
 
-        self.sketch_scale = nn.Parameter(torch.tensor([0.1]))
+        # to allow for causality
+        mask_b = torch.zeros_like(self.kron_b)
+        ratio_b = self.kron_b.shape[1] / self.kron_b.shape[0]
+        for i in range(self.kron_b.shape[0]):
+            mask_b[i, :int((i + 1) * ratio_b)] = 1.0
+        self.register_buffer("kron_b_mask", mask_b)
+        
+        mask_a = torch.zeros_like(self.kron_a)
+        ratio_a = self.kron_a.shape[1] / self.kron_a.shape[0]
+        for i in range(self.kron_a.shape[0]):
+            mask_a[i, :int((i + 1) * ratio_a)] = 1.0
+        self.register_buffer("kron_a_mask", mask_a)
+
+        self.sketch_scale = nn.Parameter(torch.tensor([1.0]))
 
         self.importance_scorer = nn.Sequential(
             nn.Linear(hidden_size, 64),
@@ -108,25 +121,16 @@ class RandNLAGQALayer(nn.Module):
             x = F.pad(x, (0, target_len - T))
         
         x = x.view(B, H, D, 128, 256)
+
+        # make kron a lower-trinagular (for autogressive-model compatibility)
+        causal_kron_b = self.kron_b * self.kron_b_mask
+        causal_kron_a = self.kron_a * self.kron_a_mask
         
-        x = torch.matmul(x, self.kron_b.t())
+        x = torch.matmul(x, causal_kron_b.t())
         x = x.transpose(-1, -2)
-        x = torch.matmul(x, self.kron_a.t())
+        x = torch.matmul(x, causal_kron_a.t())
         
         return x.flatten(-2)
-
-    def apply_expand(self, x, original_len):
-        B, H, D, S = x.shape
-        
-        x = x.view(B, H, D, 32, 20)
-        
-        x = torch.matmul(x, self.kron_a)
-        x = x.transpose(-1, -2)
-        x = torch.matmul(x, self.kron_b)
-        
-        x = x.flatten(-2)
-        
-        return x[..., :original_len]
 
     def get_importance_weights(self, x):
         _, seq_len, _ = x.shape
@@ -147,6 +151,10 @@ class RandNLAGQALayer(nn.Module):
         for chunk in chunks:
             results.append(self.target_layer.o_proj(chunk))
         return torch.cat(results, dim=1)
+    
+    def sketch_tensor(self, tensor, weights):
+        t = (tensor * weights.unsqueeze(-1)).permute(0, 2, 3, 1)
+        return self.apply_sketch(t).permute(0, 3, 1, 2)
 
     def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
         x = hidden_states
@@ -162,6 +170,7 @@ class RandNLAGQALayer(nn.Module):
         q = self.target_layer.q_norm(q)
         k = self.target_layer.k_norm(k)
         
+        q_rope = self.target_layer.rope_fn(q, cos, sin)
         actual_topk = min(seq_len, self.topk_size)
         _, topk_indices = torch.topk(importance_logits.squeeze(-1), actual_topk, dim=1)
         
@@ -173,59 +182,57 @@ class RandNLAGQALayer(nn.Module):
             H_dim, D_dim = tensor.shape[2], tensor.shape[3]
             return torch.gather(tensor, 1, indices.view(bsz, actual_topk, 1, 1).expand(-1, -1, H_dim, D_dim))
 
-        q_detail = batch_gather_heads(q, topk_indices)
         k_detail = batch_gather_heads(k, topk_indices)
         v_detail = batch_gather_heads(v, topk_indices)
         
         def batch_gather_rope(tensor, indices):
+            if tensor.size(0) != bsz:
+                tensor = tensor.expand(bsz, -1, -1, -1)
             return torch.gather(tensor, 1, indices.view(bsz, actual_topk, 1, 1).expand(-1, -1, 1, tensor.shape[-1]))
             
         cos_detail = batch_gather_rope(cos, topk_indices)
         sin_detail = batch_gather_rope(sin, topk_indices)
         
-        rest_weights = importance_weights * is_rest.unsqueeze(-1).float()
-        
-        def sketch_tensor(tensor, weights):
-            t = (tensor * weights.unsqueeze(-1)).permute(0, 2, 3, 1)
-            return self.apply_sketch(t).permute(0, 3, 1, 2)
-
-        q_sketch = sketch_tensor(q, importance_weights)
-        k_sketch = sketch_tensor(k, rest_weights)
-        v_sketch = sketch_tensor(v, rest_weights)
-
-        q_sketch *= self.sketch_scale
-        k_sketch *= self.sketch_scale
-        v_sketch *= self.sketch_scale
-
-        q_detail_rope = self.target_layer.rope_fn(q_detail, cos_detail, sin_detail)
         k_detail_rope = self.target_layer.rope_fn(k_detail, cos_detail, sin_detail)
+        
+        mask_float = is_rest.unsqueeze(-1).to(importance_weights.dtype)
+        rest_weights = importance_weights * mask_float
 
-        q_final = torch.cat([q_detail_rope, q_sketch], dim=1) 
-        k_final = torch.cat([k_detail_rope, k_sketch], dim=1) 
+        k_sketch = self.sketch_tensor(k, rest_weights) * self.sketch_scale
+        v_sketch = self.sketch_tensor(v, rest_weights) * self.sketch_scale
+
+        k_final = torch.cat([k_detail_rope, k_sketch], dim=1)
         v_final = torch.cat([v_detail, v_sketch], dim=1)
 
-        k_final = torch.repeat_interleave(k_final, self.num_heads // self.num_kv_heads, dim=2)
-        v_final = torch.repeat_interleave(v_final, self.num_heads // self.num_kv_heads, dim=2)
+        k_final = torch.repeat_interleave(k_final, self.num_heads // self.num_kv_heads, dim=2).reshape(bsz, -1, self.num_heads, self.head_dim)
+        v_final = torch.repeat_interleave(v_final, self.num_heads // self.num_kv_heads, dim=2).reshape(bsz, -1, self.num_heads, self.head_dim)
 
-        attn_output = nn.functional.scaled_dot_product_attention(
-            q_final.transpose(1, 2), k_final.transpose(1, 2), v_final.transpose(1, 2), attn_mask=None, is_causal=False
-        ).transpose(1, 2)
-
-        out_det = attn_output[:, :actual_topk].flatten(2)
-        out_sketch = attn_output[:, actual_topk:].flatten(2)
-
-        out_sketch_reshaped = out_sketch.view(bsz, self.sketch_size, self.num_heads, self.head_dim).permute(0, 2, 3, 1)
-        output_full = self.apply_expand(out_sketch_reshaped, seq_len)
+        q_time = torch.arange(seq_len, device=x.device).view(1, seq_len, 1)
         
-        output_full = output_full.permute(0, 3, 1, 2).flatten(2)
-        gather_dim = output_full.size(-1) 
-        gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, gather_dim)
+        k_time_detail = topk_indices.unsqueeze(1)
+        mask_detail = k_time_detail <= q_time
         
-        output_full_at_topk = torch.gather(output_full, 1, gather_idx)
+        ratio = (self.kron_a.shape[1] * self.kron_b.shape[1]) / self.sketch_size
+        sketch_times = (torch.arange(self.sketch_size, device=x.device) * ratio).view(1, 1, self.sketch_size)
+        mask_sketch = (sketch_times <= q_time).expand(bsz, seq_len, self.sketch_size)
+        
+        attn_mask = torch.cat([mask_detail, mask_sketch], dim=-1).unsqueeze(1)
 
-        E = out_det - output_full_at_topk
-        
-        output_full = output_full.scatter_add(1, topk_indices.unsqueeze(-1).expand(-1, -1, gather_dim), E)
+        output_chunks = []
+        q_chunk_size = 1024 
+        for i in range(0, seq_len, q_chunk_size):
+            q_chunk = q_rope[:, :, i : i + q_chunk_size, :]
+            mask_chunk = attn_mask[:, :, i : i + q_chunk_size, :]
+            
+            out_chunk = nn.functional.scaled_dot_product_attention(
+                q_chunk, k_final, v_final, 
+                attn_mask=mask_chunk, is_causal=False
+            )
+            output_chunks.append(out_chunk)
+
+        attn_output = torch.cat(output_chunks, dim=2)
+
+        output_full = attn_output.flatten(2)
 
         if self.training and seq_len > 2048:
             return self.compute_efficient_oproj(output_full)
@@ -235,7 +242,6 @@ class RandNLAGQALayer(nn.Module):
 class RandNLALatentAttention(RandNLAGQALayer):
     def __init__(self, original_layer: Attention, sketch_size=640):
         super().__init__(original_layer, sketch_size)
-        self.num_key_value_heads = self.num_kv_heads
     def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
         x = hidden_states
         bsz, seq_len, _ = x.shape
@@ -253,76 +259,81 @@ class RandNLALatentAttention(RandNLAGQALayer):
         is_topk.scatter_(1, topk_indices, True)
         is_rest = ~is_topk
 
+        q_all = self.target_layer.q_b(c_q).view(bsz, seq_len, self.num_heads, self.head_dim)
+        
+        alpha = torch.sigmoid(self.target_layer.nope_logit)
+        q_pe = self.target_layer.rope_fn(q_all, cos, sin)
+        q_final = (alpha * q_all) + ((1 - alpha) * q_pe)
+        
+        q_final = q_final.transpose(1, 2)
+
         def batch_gather(tensor, indices):
             return torch.gather(tensor, 1, indices.unsqueeze(-1).expand(-1, -1, tensor.size(-1)))
-
-        q_det_lat = batch_gather(c_q, topk_indices)
-        kv_det_lat = batch_gather(c_kv, topk_indices)
         
-        rest_weights = importance_weights * is_rest.unsqueeze(-1).float()
+        c_kv_detail = batch_gather(c_kv, topk_indices)
         
-        c_q_in = (c_q * importance_weights).permute(0, 2, 1).unsqueeze(1)
-        c_kv_in = (c_kv * rest_weights).permute(0, 2, 1).unsqueeze(1)
+        mask_float = is_rest.unsqueeze(-1).to(importance_weights.dtype)
+        rest_weights = importance_weights * mask_float
+
+        c_kv_sketch = self.sketch_tensor(c_kv, rest_weights) * self.sketch_scale
+        c_kv_final = torch.cat([c_kv_detail, c_kv_sketch], dim=1)
         
-        q_rest_sketch_lat = self.apply_sketch(c_q_in).squeeze(1).transpose(1, 2)
-        kv_rest_sketch_lat = self.apply_sketch(c_kv_in).squeeze(1).transpose(1, 2)
-
-        q_rest_sketch_lat *= self.sketch_scale
-        kv_rest_sketch_lat *= self.sketch_scale
-
-        combined_lat_q = torch.cat([q_det_lat, q_rest_sketch_lat], dim=1)
-        combined_lat_kv = torch.cat([kv_det_lat, kv_rest_sketch_lat], dim=1)
-
-        q_all = self.target_layer.q_b(combined_lat_q).view(bsz, -1, self.num_heads, self.head_dim)
-        kv_all = self.target_layer.kv_b(combined_lat_kv)
-        k_all, v_all = torch.chunk(kv_all, 2, dim=-1)
-        k_all = k_all.view(bsz, -1, self.num_kv_heads, self.head_dim)
-        v_all = v_all.view(bsz, -1, self.num_kv_heads, self.head_dim)
-
+        kv_out = self.target_layer.kv_b(c_kv_final)
+        k_out, v_out = torch.chunk(kv_out, 2, dim=-1)
+        
+        k_out = k_out.view(bsz, -1, self.num_kv_heads, self.head_dim)
+        v_out = v_out.view(bsz, -1, self.num_kv_heads, self.head_dim)
+        
+        k_detail = k_out[:, :actual_topk]
+        k_sketch = k_out[:, actual_topk:]
+        
         def batch_gather_rope(tensor, indices):
+            if tensor.size(0) != bsz:
+                tensor = tensor.expand(bsz, -1, -1, -1)
             return torch.gather(tensor, 1, indices.view(bsz, actual_topk, 1, 1).expand(-1, -1, 1, tensor.shape[-1]))
 
         cos_det = batch_gather_rope(cos, topk_indices)
         sin_det = batch_gather_rope(sin, topk_indices)
         
-        alpha = torch.sigmoid(self.target_layer.nope_logit)
+        k_detail_pe = self.target_layer.rope_fn(k_detail, cos_det, sin_det)
+        k_detail_final = (alpha * k_detail) + ((1 - alpha) * k_detail_pe)
         
-        q_det = q_all[:, :actual_topk]
-        q_pe = self.target_layer.rope_fn(q_det, cos_det, sin_det)
-        q_all_rope = alpha * q_det + (1 - alpha) * q_pe
+        k_sketch_final = k_sketch * alpha
         
-        k_det = k_all[:, :actual_topk]
-        k_pe = self.target_layer.rope_fn(k_det, cos_det, sin_det)
-        k_all_rope = alpha * k_det + (1 - alpha) * k_pe
+        k_final = torch.cat([k_detail_final, k_sketch_final], dim=1)
+        v_final = v_out
+
+        k_final = torch.repeat_interleave(k_final, self.num_heads // self.num_kv_heads, dim=2).reshape(bsz, -1, self.num_heads, self.head_dim)
+        v_final = torch.repeat_interleave(v_final, self.num_heads // self.num_kv_heads, dim=2).reshape(bsz, -1, self.num_heads, self.head_dim)
+            
+        k_final = k_final.transpose(1, 2)
+        v_final = v_final.transpose(1, 2)
+
+        q_time = torch.arange(seq_len, device=x.device).view(1, seq_len, 1)
+        k_time_detail = topk_indices.unsqueeze(1)
+        mask_detail = k_time_detail <= q_time
         
-        q_sketch_final = q_all[:, actual_topk:] * alpha
-        k_sketch_final = k_all[:, actual_topk:] * alpha
+        ratio = seq_len / self.sketch_size
+        sketch_times = (torch.arange(self.sketch_size, device=x.device) * ratio).view(1, 1, self.sketch_size)
+        mask_sketch = (sketch_times <= q_time).expand(bsz, seq_len, self.sketch_size)
         
-        q_final = torch.cat([q_all_rope, q_sketch_final], dim=1)
-        k_final = torch.cat([k_all_rope, k_sketch_final], dim=1)
-        v_final = v_all
+        attn_mask = torch.cat([mask_detail, mask_sketch], dim=-1).unsqueeze(1)
 
-        n_rep = self.num_heads // self.num_kv_heads
-        k_final = torch.repeat_interleave(k_final, n_rep, dim=2)
-        v_final = torch.repeat_interleave(v_final, n_rep, dim=2)
+        output_chunks = []
+        q_chunk_size = 1024 
+        
+        for i in range(0, seq_len, q_chunk_size):
+            q_chunk = q_final[:, :, i : i + q_chunk_size, :]
+            mask_chunk = attn_mask[:, :, i : i + q_chunk_size, :]
+            
+            out_chunk = nn.functional.scaled_dot_product_attention(
+                q_chunk, k_final, v_final, 
+                attn_mask=mask_chunk, is_causal=False
+            )
+            output_chunks.append(out_chunk)
 
-        attn_out = nn.functional.scaled_dot_product_attention(
-            q_final.transpose(1, 2), 
-            k_final.transpose(1, 2), 
-            v_final.transpose(1, 2), 
-            is_causal=False,
-        ).transpose(1, 2)
-
-        out_det = attn_out[:, :actual_topk].flatten(2)
-        out_sketch = attn_out[:, actual_topk:].flatten(2)
-
-        out_sketch_reshaped = out_sketch.view(bsz, self.sketch_size, self.num_heads, self.head_dim).permute(0, 2, 3, 1)
-        output_full = self.apply_expand(out_sketch_reshaped, seq_len).permute(0, 3, 1, 2).flatten(2)
-
-        output_full_at_topk = batch_gather(output_full, topk_indices)
-
-        E = out_det - output_full_at_topk
-        output_full = output_full.scatter_add(1, topk_indices.unsqueeze(-1).expand(-1, -1, output_full.size(-1)), E)
+        attn_output = torch.cat(output_chunks, dim=2)
+        output_full = attn_output.transpose(1, 2).flatten(2)
 
         if self.training and seq_len > 2048:
             return self.compute_efficient_oproj(output_full)

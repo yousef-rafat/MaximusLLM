@@ -41,7 +41,7 @@ SAVE_EVERY_STEP = 10_000
 QAT_TRAINING = False
 ACCUM_STEPS = 21
 TOTAL_NUMBER_OF_STEPS = 1_984 // ACCUM_STEPS
-PACKING = True
+PACKING = True if not LONG_CONTEXT_TRAINING else False
 WARMUP = max(30, TOTAL_NUMBER_OF_STEPS * 0.05) # stability
 DECAY = TOTAL_NUMBER_OF_STEPS * 0.1
 STABLE = TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY)
@@ -155,8 +155,8 @@ def get_packed_mask_and_pos_ids(input_ids, eos_token_id):
 class HFStreamDataset(IterableDataset):
     def __init__(
         self,
-        dataset_name: str = "HuggingFaceTB/smollm-corpus",
-        subset = "cosmopedia-v2",
+        dataset_name: str = "HuggingFaceFW/fineweb-edu",
+        subset = "default",
         rank=0,
         world_size=1,
         files_to_skip=0
@@ -169,6 +169,7 @@ class HFStreamDataset(IterableDataset):
 
         self.tokenizer = AutoTokenizer.from_pretrained("yousefg/MaximusLLM")
         self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
+        self.pad_token = self.tokenizer.pad_token_id
 
         self.TOKENS_PER_FILE_EST = 500_000_000 
         self.ROWS_PER_FILE_EST = 300_000 
@@ -271,6 +272,13 @@ class HFStreamDataset(IterableDataset):
                     b = (torch.tensor(batch, dtype=torch.long), torch.tensor(labels, dtype=torch.long))
             yield b 
 
+        def return_padded_batch(batch, pad_token_id=self.pad_token):
+            max_l = max([t.size(0) for t in batch])
+            padded_batch = torch.full((len(batch), max_l), pad_token_id, dtype=torch.long)
+            for i, t in enumerate(batch):
+                padded_batch[i, :t.size(0)] = t
+            return padded_batch
+
 
         def do_pack():
             nonlocal batch, batch_labels
@@ -317,14 +325,15 @@ class HFStreamDataset(IterableDataset):
                 # the rest variable length samples gets to buffer with packing logic
                 full_tokens = tokens + [self.eos_token]
                 doc_len = len(full_tokens)
+                current_target_len = random.choices([2048, MAX_LENGTH // 2, MAX_LENGTH], weights=[0.5, 0.3, 0.2], k=1)[0]
 
-                if doc_len > MAX_LENGTH:
+                if doc_len > current_target_len:
                     roll = random.random()
                     
                     # random 32k window from a large document
                     if roll < Settings.random_slice_prob:
-                        start = random.randint(0, doc_len - MAX_LENGTH)
-                        segment = full_tokens[start : start + MAX_LENGTH]
+                        start = random.randint(0, doc_len - current_target_len)
+                        segment = full_tokens[start : start + current_target_len]
                         
                         batch.append(torch.tensor(segment, dtype=torch.long))
                         if len(batch) == Settings.batch_size:
@@ -332,21 +341,17 @@ class HFStreamDataset(IterableDataset):
                             batch = []
 
                     else:
-                        for j in range(0, doc_len, MAX_LENGTH):
-                            chunk = full_tokens[j : j + MAX_LENGTH]
+                        for j in range(0, doc_len, current_target_len):
+                            chunk = full_tokens[j : j + current_target_len]
                             
-                            if len(chunk) == MAX_LENGTH:
+                            if len(chunk) == current_target_len:
                                 batch.append(torch.tensor(chunk, dtype=torch.long))
                                 if len(batch) == Settings.batch_size:
                                     yield from return_batch(batch)
                                     batch = []
                             else:
                                 buffer.extend(chunk)
-
-                else:
-                    buffer.extend(full_tokens)
-
-                yield from do_pack()
+                yield return_padded_batch(batch)
             else:
                 tokens = tokens[: MAX_LENGTH - 2]
                 tokens += [self.eos_token]
