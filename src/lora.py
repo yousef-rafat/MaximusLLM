@@ -153,9 +153,11 @@ class RandNLAGQALayer(nn.Module):
         return torch.cat(results, dim=1)
     
     def sketch_tensor(self, tensor, weights):
-        t = (tensor * weights.unsqueeze(-1)).permute(0, 2, 3, 1)
-        return self.apply_sketch(t).permute(0, 3, 1, 2)
-
+        t = tensor * weights
+        t = t.transpose(1, 2).unsqueeze(1)
+        
+        sketched = self.apply_sketch(t)
+        return sketched.squeeze(1).transpose(1, 2)
     def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
         x = hidden_states
         bsz, seq_len, _ = x.shape
@@ -198,8 +200,15 @@ class RandNLAGQALayer(nn.Module):
         mask_float = is_rest.unsqueeze(-1).to(importance_weights.dtype)
         rest_weights = importance_weights * mask_float
 
-        k_sketch = self.sketch_tensor(k, rest_weights) * self.sketch_scale
-        v_sketch = self.sketch_tensor(v, rest_weights) * self.sketch_scale
+        def sketch_tensor(tensor, weights):
+            t = tensor * weights
+            t = t.permute(0, 2, 3, 1).contiguous()
+            sketched = self.apply_sketch(t)
+            return sketched.permute(0, 3, 1, 2).contiguous()
+
+
+        k_sketch = sketch_tensor(k, rest_weights.unsqueeze(-1)) * self.sketch_scale
+        v_sketch = sketch_tensor(v, rest_weights.unsqueeze(-1)) * self.sketch_scale
 
         k_final = torch.cat([k_detail_rope, k_sketch], dim=1)
         v_final = torch.cat([v_detail, v_sketch], dim=1)
@@ -220,6 +229,7 @@ class RandNLAGQALayer(nn.Module):
 
         output_chunks = []
         q_chunk_size = 1024 
+        q_rope, k_final, v_final = [t.transpose(1, 2) for t in (q_rope, k_final, v_final)]
         for i in range(0, seq_len, q_chunk_size):
             q_chunk = q_rope[:, :, i : i + q_chunk_size, :]
             mask_chunk = attn_mask[:, :, i : i + q_chunk_size, :]
@@ -230,7 +240,7 @@ class RandNLAGQALayer(nn.Module):
             )
             output_chunks.append(out_chunk)
 
-        attn_output = torch.cat(output_chunks, dim=2)
+        attn_output = torch.cat(output_chunks, dim=2).transpose(1, 2)
 
         output_full = attn_output.flatten(2)
 
