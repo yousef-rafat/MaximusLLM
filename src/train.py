@@ -201,7 +201,7 @@ class HFStreamDataset(IterableDataset):
 
             self.all_files = []
             for f in all_repo_files:
-                if f.endswith(".parquet") and (subset in f):
+                if f.endswith(".parquet") and f.startswith("data/"):
                     self.all_files.append(f)
             
             self.all_files = sorted(self.all_files)
@@ -325,7 +325,8 @@ class HFStreamDataset(IterableDataset):
                 # the rest variable length samples gets to buffer with packing logic
                 full_tokens = tokens + [self.eos_token]
                 doc_len = len(full_tokens)
-                current_target_len = random.choices([2048, MAX_LENGTH // 2, MAX_LENGTH], weights=[0.5, 0.3, 0.2], k=1)[0]
+                if len(batch) == 0:
+                    current_target_len = random.choices([2048, MAX_LENGTH // 2, MAX_LENGTH], weights=[0.5, 0.3, 0.2], k=1)[0]
 
                 if doc_len > current_target_len:
                     roll = random.random()
@@ -334,24 +335,24 @@ class HFStreamDataset(IterableDataset):
                     if roll < Settings.random_slice_prob:
                         start = random.randint(0, doc_len - current_target_len)
                         segment = full_tokens[start : start + current_target_len]
-                        
                         batch.append(torch.tensor(segment, dtype=torch.long))
-                        if len(batch) == Settings.batch_size:
-                            yield from return_batch(batch)
-                            batch = []
 
                     else:
                         for j in range(0, doc_len, current_target_len):
                             chunk = full_tokens[j : j + current_target_len]
                             
-                            if len(chunk) == current_target_len:
+                            if len(chunk) > 50:
                                 batch.append(torch.tensor(chunk, dtype=torch.long))
                                 if len(batch) == Settings.batch_size:
-                                    yield from return_batch(batch)
+                                    yield from return_padded_batch(batch)
                                     batch = []
-                            else:
-                                buffer.extend(chunk)
-                yield return_padded_batch(batch)
+
+                elif doc_len > (current_target_len * 0.75): # maximum of 25% padding
+                    batch.append(torch.tensor(full_tokens, dtype=torch.long))
+
+                if len(batch) == Settings.batch_size:
+                    yield return_padded_batch(batch)
+                    batch = []
             else:
                 tokens = tokens[: MAX_LENGTH - 2]
                 tokens += [self.eos_token]
