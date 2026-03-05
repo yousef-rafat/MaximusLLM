@@ -95,13 +95,13 @@ class RandNLAGQALayer(nn.Module):
         ratio_b = self.kron_b.shape[1] / self.kron_b.shape[0]
         for i in range(self.kron_b.shape[0]):
             mask_b[i, :int((i + 1) * ratio_b)] = 1.0
-        self.register_buffer("kron_b_mask", mask_b)
+        self.register_buffer("kron_b_mask", mask_b, persistent=False)
         
         mask_a = torch.zeros_like(self.kron_a)
         ratio_a = self.kron_a.shape[1] / self.kron_a.shape[0]
         for i in range(self.kron_a.shape[0]):
             mask_a[i, :int((i + 1) * ratio_a)] = 1.0
-        self.register_buffer("kron_a_mask", mask_a)
+        self.register_buffer("kron_a_mask", mask_a, persistent=False)
 
         self.sketch_scale = nn.Parameter(torch.tensor([1.0]))
 

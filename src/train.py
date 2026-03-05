@@ -326,7 +326,7 @@ class HFStreamDataset(IterableDataset):
                 full_tokens = tokens + [self.eos_token]
                 doc_len = len(full_tokens)
                 if len(batch) == 0:
-                    current_target_len = random.choices([2048, MAX_LENGTH // 2, MAX_LENGTH], weights=[0.5, 0.3, 0.2], k=1)[0]
+                    current_target_len = random.choices([2048, MAX_LENGTH // 2, MAX_LENGTH], weights=[0.3, 0.3, 0.4], k=1)[0]
 
                 if doc_len > current_target_len:
                     roll = random.random()
@@ -344,7 +344,7 @@ class HFStreamDataset(IterableDataset):
                             if len(chunk) > 50:
                                 batch.append(torch.tensor(chunk, dtype=torch.long))
                                 if len(batch) == Settings.batch_size:
-                                    yield from return_padded_batch(batch)
+                                    yield return_padded_batch(batch)
                                     batch = []
 
                 elif doc_len > (current_target_len * 0.75): # maximum of 25% padding
