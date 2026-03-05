@@ -1,82 +1,142 @@
-import time
+import numpy as np
+import matplotlib.pyplot as plt
+import lm_eval
+from lm_eval.utils import make_table
+from model import Model, Config
+from transformers import AutoTokenizer
+from safetensors.torch import load_file
+from lm_eval.models.huggingface import HFLM
+from huggingface_hub import hf_hub_download
 import torch
-from datasets import load_dataset
-from torch.src.infer import general_generate_fn
 
-def benchmark_forward(model, input_sample, attention_mask, device="cpu", runs=20): # for speed/performance
-    model = model.to(device)
-    input_sample = input_sample.to(device)
-    attention_mask = attention_mask.to(device)
-    model.eval()
+MODELS = {
+    "MaximusLLM (0.19B)": "yousefg/MaximusLLM", 
+    "Qwen2.5 (0.5B)": "Qwen/Qwen2.5-0.5B",
+    "SmolLM2 (360M)": "HuggingFaceTB/SmolLM2-360M",
+    "OPT (350M)": "facebook/opt-350m"
+}
 
-    torch.set_grad_enabled(False)
+TASKS = ["arc_easy", "hellaswag", "piqa", "boolq"]
 
-    # warmup
-    for _ in range(3):
-        _ = model(input_sample, attention_mask)
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
+DEVICE = "cuda:0"
+BATCH_SIZE = "auto"
 
-    times = []
-    for _ in range(runs):
-        start = time.time()
-        _ = model(input_sample, attention_mask)
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-        end = time.time()
-        times.append(end - start)
+class HFWrapper(torch.nn.Module):
+    def __init__(self, base_model, config):
+        super().__init__()
+        self.base_model = base_model
+        self.config = config
+        
+    @property
+    def device(self):
+        return next(self.base_model.parameters()).device
 
-    avg = sum(times) / len(times)
-    return avg
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        out = self.base_model(input_ids, attention_mask=attention_mask)
+            
+        if isinstance(out, torch.Tensor):
+            class DummyOutput:
+                def __init__(self, logits):
+                    self.logits = logits
+            return DummyOutput(out)
+        return out
 
-def general_benchmark_fn(model, tokenizer, prompt):
-    inputs = tokenizer.encode(prompt)
-    if hasattr(model, "generate"):
-        outputs = model.generate(*inputs, do_sample = False)
-    else:
-        outputs = general_generate_fn(model, inputs, tokenizer.eos_token)
-    generated_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-    return generated_text.strip().lower()
+def run_evaluations():
+    all_results = {}
+    
+    for model_name, model_id in MODELS.items():
+        print(f"\n{'='*50}")
+        print(f"Evaluating {model_name} ({model_id})...")
+        print(f"{'='*50}\n")
 
-# ACCURACY BASED
-def bench_mark_glue(model, model2, tokenizer):
-    dataset = load_dataset("aps/super_glue", split="train", streaming = True)
-    id2label = {0: "yes", 1: "no"}
-    correct_model_1 = 0
-    correct_model_2 = 0
-    for batch in dataset:
-        sentence1, sentence2 = batch["sentence1"], batch["sentence2"]
-        prompt = (
-            f"Premise: {sentence1}\n"
-            f"Hypothesis: {sentence2}\n"
-            f"Question: Does the premise imply the hypothesis? Yes or No?\n"
-            f"Answer:"
-        )
-        label_str = id2label[batch["label"]]
-        out1 = general_benchmark_fn(model, tokenizer, prompt)
-        out2 = general_benchmark_fn(model2, tokenizer, prompt)
+        if model_name == "MaximusLLM (0.19B)":
+            config = Config.from_pretrained(model_id)
+            model = Model(config, DEVICE)
+            ckpt = load_file(hf_hub_download(model_id, "model.safetensors"))
+            model.load_state_dict(ckpt)
+            model.eval()
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-        if out1.startswith(label_str):
-            correct_model_1 += 1
-        if out2.startswith(label_str):
-            correct_model_2 += 1
+            model = HFWrapper(model, config)
 
-    print(f"Total correct answers for model 1: {correct_model_1}")
-    print(f"Total correct answers for model 2: {correct_model_2}")
+            lm_obj = HFLM(
+                pretrained=model, 
+                tokenizer=tokenizer, 
+                batch_size=BATCH_SIZE
+            )
 
+            results = lm_eval.simple_evaluate(
+                model=lm_obj,
+                tasks=TASKS,
+                num_fewshot=0,
+            )
+
+        else:    
+            results = lm_eval.simple_evaluate(
+                model="hf",
+                model_args=f"pretrained={model_id}",
+                tasks=TASKS,
+                num_fewshot=0,
+                device=DEVICE,
+                batch_size=BATCH_SIZE,
+            )
+        
+        print(f"\nResults for {model_name}:")
+        print(make_table(results))
+        
+        model_metrics = {}
+        for task in TASKS:
+            task_data = results["results"].get(task, {})
+            acc = task_data.get("acc_norm,none", task_data.get("acc,none", 0.0))
+            model_metrics[task] = acc * 100 
+            
+        all_results[model_name] = model_metrics
+        
+    return all_results
+
+def plot_results(all_results):
+    print("\nGenerating visualization...")
+    
+    plt.style.use('seaborn-v0_8-darkgrid')
+    _, ax = plt.subplots(figsize=(12, 7))
+    
+    model_names = list(MODELS.keys())
+    task_names = TASKS
+    
+    x = np.arange(len(task_names))
+    width = 0.8 / len(model_names)
+    
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd'][:len(model_names)]
+    
+    for i, model_name in enumerate(model_names):
+        offset = (i - len(model_names)/2 + 0.5) * width
+        scores = [all_results[model_name][task] for task in task_names]
+        
+        bars = ax.bar(x + offset, scores, width, label=model_name, color=colors[i], edgecolor='white')
+        
+        for bar in bars:
+            yval = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2, yval + 1, f'{yval:.1f}', 
+                    ha='center', va='bottom', fontsize=9, fontweight='bold', color='#333333')
+
+    ax.set_ylabel('Accuracy / Normalized Accuracy (%)', fontsize=12, fontweight='bold')
+    ax.set_title('Zero-Shot Benchmark Comparison (0.2B - 0.6B Parameters)', fontsize=16, fontweight='bold', pad=20)
+    ax.set_xticks(x)
+    
+    display_names = [t.replace("_", " ").title() for t in task_names]
+    ax.set_xticklabels(display_names, fontsize=12, fontweight='bold')
+    
+    ax.legend(title='Models', title_fontsize='12', fontsize='11', loc='upper right', bbox_to_anchor=(1.15, 1))
+    
+    ax.axhline(50, color='gray', linestyle='--', alpha=0.5, zorder=0)
+    ax.text(-0.5, 50.5, 'Random Baseline (Binary)', color='gray', fontsize=9)
+
+    plt.tight_layout()
+    
+    plt.savefig("benchmark_comparison.png", dpi=300, bbox_inches='tight')
+    print("Plot saved as 'benchmark_comparison.png'")
+    plt.show()
 
 if __name__ == "__main__":
-    model1 = ...
-    model2 = ...
-
-    dummy = torch.randint(0, 30000, (1, 4_000))
-    attention_mask = torch.ones_like(dummy)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    t1 = benchmark_forward(model1, dummy, attention_mask, device)
-    t2 = benchmark_forward(model2, dummy, attention_mask, device)
-
-    print(f"Model 1 avg time: {t1*1000:.3f} ms")
-    print(f"Model 2 avg time: {t2*1000:.3f} ms")
-    print(f"Speedup: {t2/t1:.2f}x (model1 vs model2)")
+    results = run_evaluations()
+    plot_results(results)
