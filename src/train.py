@@ -803,7 +803,7 @@ def main(local_rank, world_size):
         save_model(get_raw_model(model), "model.safetensors")
         if hasattr(os, 'sync'):
             os.sync()
-        update_model_hf(os.path.abspath("model.safetensors"))
+        update_model_hf(os.path.abspath("model.safetensors"), full_replace=True)
         print("model saved")
 
     dist.barrier()

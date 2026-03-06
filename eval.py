@@ -11,7 +11,7 @@ import torch
 
 MODELS = {
     "MaximusLLM (0.19B)": "yousefg/MaximusLLM", 
-    "Qwen2.5 (0.5B)": "Qwen/Qwen2.5-0.5B",
+    "Gemma3 (0.27B)": "google/gemma-3-270m",
     "SmolLM2 (360M)": "HuggingFaceTB/SmolLM2-360M",
     "OPT (350M)": "facebook/opt-350m"
 }
