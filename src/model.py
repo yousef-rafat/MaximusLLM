@@ -551,6 +551,7 @@ class Model(nn.Module):
         return logits
 
     # step hook
+    # (experimental) could be used for inference but not for training
     @torch.no_grad()
     def balance_svd_layers(self):
         # force latent attn layers A and B to have same mag.

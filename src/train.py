@@ -46,10 +46,6 @@ WARMUP = max(30, TOTAL_NUMBER_OF_STEPS * 0.05) # stability
 DECAY = TOTAL_NUMBER_OF_STEPS * 0.1
 STABLE = TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY)
 
-# hook: frequency_in_steps
-TRAINING_HOOKS = {"balance_svd_layers": 1}
-
-
 def lr_scheduler_fn(optimizer, min_lr=0.1):
     def scheduler(current_step):
         if current_step < WARMUP:
@@ -738,15 +734,6 @@ def main(local_rank, world_size):
                 scaler.unscale_(main_optimizer)
             scaler.unscale_(second_optimizer)
 
-            for k, v in TRAINING_HOOKS.items():
-                if hasattr(model.module, k):
-                    div_steps = v
-                    if div_steps == 0:
-                        continue
-                    attr = getattr(model.module, k)
-                    if (((step + 1) // ACCUM_STEPS) % div_steps) == 0:
-                        attr()
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             old_scale = scaler.get_scale()
@@ -780,7 +767,7 @@ def main(local_rank, world_size):
                 print(
                     f"step {(step // ACCUM_STEPS):05d} | loss {(smoothed_loss):.4f}"
                 )
-                #losses.append(loss.detach().cpu())
+                losses.append(loss.detach().cpu())
             
             running_loss = 0
             
@@ -805,6 +792,8 @@ def main(local_rank, world_size):
             os.sync()
         update_model_hf(os.path.abspath("model.safetensors"), full_replace=True)
         print("model saved")
+        plt.plot(losses)
+        plt.savefig("loss_fig.png")
 
     dist.barrier()
     dist.destroy_process_group()
@@ -815,5 +804,3 @@ if __name__ == "__main__":
     os.environ["MASTER_PORT"] = "29500"
     world_size = torch.cuda.device_count()
     mp.spawn(main, args=(world_size,), nprocs=world_size, join=True)
-    plt.plot(losses)
-    plt.savefig("loss_fig.png")
