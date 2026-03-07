@@ -19,7 +19,8 @@ By combining three novel mathematical breakthroughs, MaximusLLM achieves state-o
 
 MaximusLLM is optimized for the only metric that matters: **how much the model learns per dollar of compute.**
 
-<img width="100%" alt="Maximus Benchmark" src="https://github.com/user-attachments/assets/4120228b-0c46-466b-a381-3f71932c56d7" />
+<img width="100%" alt="Maximus Benchmark" src="https://github.com/user-attachments/assets/f47083b5-03bc-4268-bb8a-22d287d1e3e5" />
+
 
 | Metric | Standard CE (Liger) | **MAXIS (Ours)** | **Improvement** |
 | :--- | :--- | :--- | :--- |
@@ -53,7 +54,7 @@ By training in a hierarchical format, Maximus natively optimizes knowledge into 
 
 
 ### 2. RandNLA Latent Attention
-**Bifurcated Information Highway**
+<img width="2190" height="590" alt="randnla_gqa_lin" src="https://github.com/user-attachments/assets/d7dd0fe1-e3a2-406b-a5a0-3bf29822f520" />
 
 Traditional attention is $O(N^2)$. **RandNLA Attention** splits the memory into two mathematically distinct paths to achieve $O(N \cdot K)$ complexity without sacrificing discrete recall.
 
