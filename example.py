@@ -1,6 +1,6 @@
 # NOTE: MaximusLLM is still getting improved
 #       The current version is a proof-of-concept
-#       Focus is on the efficiency of RandNLA Attention and MAXIS Loss
+#       Focus is on the efficiency and benefits of RandNLA Attention and MAXIS Loss
 
 from src.model import Model, Config
 from src.lora import blockswap_attention_layers
