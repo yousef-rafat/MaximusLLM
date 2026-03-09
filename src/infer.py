@@ -82,7 +82,8 @@ def general_generate_fn(model, inputs, tokenizer, max_new_tokens=50, temperature
     return generated_ids
 
 
-def test_general_talking(model, tokenizer, temperature = 1.0, device="cuda"):
-    tokens = tokenizer(general_talking_prompt)["input_ids"]
+def test_general_talking(model, tokenizer, prompt=None, temperature = 1.0, device="cuda"):
+    prompt = prompt or general_talking_prompt
+    tokens = tokenizer(prompt)["input_ids"]
     out = general_generate_fn(model, tokens, tokenizer, temperature=temperature, device=device)
     print(tokenizer.decode(out[0], skip_special_tokens = True))

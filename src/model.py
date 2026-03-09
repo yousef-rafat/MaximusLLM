@@ -401,7 +401,7 @@ def apply_custom_checkpointer(module, hidden_states, **kwargs):
 
 class Model(nn.Module):
 
-    def __init__(self, config: Config, device="cpu", enabled_lm_head=False):
+    def __init__(self, config: Config, device="cpu"):
         super().__init__()
 
         self.config = config
@@ -422,11 +422,13 @@ class Model(nn.Module):
         config = copy.deepcopy(config)
         config.rope_theta = config.rope_local_base_freq
         self.rotary_emb_local = RotaryEmbedding(config=config, device = device)
-        if enabled_lm_head:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, device="meta")
-            self.lm_head.weight = self.embed_tokens.weight
         self.gradient_checkpointing = False
         self.use_custom_ckpt_fn = False
+
+    def create_lm_head(self):
+        config = self.config
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, device="meta")
+        self.lm_head.weight = self.embed_tokens.weight
 
     def init_latent_attention(self, num_batches=100):
         model = AutoModelForCausalLM.from_pretrained(
