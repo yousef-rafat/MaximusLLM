@@ -45,6 +45,9 @@ PACKING = True if not LONG_CONTEXT_TRAINING else False
 WARMUP = max(30, TOTAL_NUMBER_OF_STEPS * 0.05) # stability
 DECAY = TOTAL_NUMBER_OF_STEPS * 0.1
 STABLE = TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY)
+SKIP_BLOCK_MASK = True
+if SKIP_BLOCK_MASK:
+    LONG_CONTEXT_TRAINING = False
 
 def lr_scheduler_fn(optimizer, min_lr=0.1):
     def scheduler(current_step):
@@ -693,14 +696,11 @@ def main(local_rank, world_size):
                     input_ids = inputs
                     labels = input_ids
 
-                attention_mask, position_ids = get_packed_mask_and_pos_ids(input_ids, eos_token)
-                # safety
-                if input_ids.max().item() > model.module.embed_tokens.weight.shape[0]:
-                    print("skipping batch")
-                    step += 1
-                    if step == TOTAL_NUMBER_OF_STEPS:
-                        break
-                    continue
+                if not SKIP_BLOCK_MASK:
+                    attention_mask, position_ids = get_packed_mask_and_pos_ids(input_ids, eos_token)
+                else:
+                    attention_mask, position_ids = None, None
+
                 logits = model(
                     input_ids, attention_mask=attention_mask, cache_position=position_ids, return_hidden=True
                 )

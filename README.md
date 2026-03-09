@@ -73,8 +73,6 @@ The background context is compressed using **Randomized Numerical Linear Algebra
 As shown in the benchmarks, Fisher SVD significantly reduces semantic error compared to standard SVD, keeping the model's knowledge intact during architectural shifts.
 
 ## Quick Start
-
-### Inference
 ```bash
 git clone https://github.com/yousef-rafat/MaximusLLM.git
 python example.py --prompt "Prompt Here..."
