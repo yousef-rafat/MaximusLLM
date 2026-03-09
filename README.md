@@ -75,13 +75,11 @@ As shown in the benchmarks, Fisher SVD significantly reduces semantic error comp
 ## Quick Start
 
 ### Inference
-```python
-from transformers import AutoTokenizer
-from model import Model, Config 
+```bash
+git clone https://github.com/yousef-rafat/MaximusLLM.git
+python example.py --prompt "Prompt Here..."
+```
 
-model = Model.from_pretrained("yousefg/MaximusLLM")
-tokenizer = AutoTokenizer.from_pretrained("yousefg/MaximusLLM")
-
-# 32K context inference on a single T4
-inputs = tokenizer("Your long document...", return_tensors="pt").to("cuda")
-output = model.generate(**inputs, max_new_tokens=100)
+## License
+MaximusLLM is released under the **[MIT License](LICENSE)**. 
+Feel free to use, modify, and build upon this research.
