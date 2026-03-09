@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 
@@ -30,7 +31,7 @@ Introduce yourself in one short sentence and say one helpful tip about learning 
 """
 
 @torch.inference_mode()
-def general_generate_fn(model, inputs, tokenizer, max_new_tokens = 50, temperature = 1.0, device="cuda"):
+def general_generate_fn(model, inputs, tokenizer, max_new_tokens=50, temperature=1.0, device="cuda", repetition_penalty=1.2, top_k=50):
 
     if not isinstance(inputs, torch.Tensor):
         inputs = torch.tensor(inputs)
@@ -44,28 +45,30 @@ def general_generate_fn(model, inputs, tokenizer, max_new_tokens = 50, temperatu
     generated_ids = inputs.clone()
     past_key_values = None
     sample = None # <- error silencer
-    embed_weight = F.normalize(model.embed_tokens.weight, p = 2, dim = -1)
 
     for i in range(max_new_tokens):
         current_inputs = inputs if i == 0 else sample
         seq_len = generated_ids.shape[1]
-        input_len = current_inputs.shape[1]
-        position_ids = torch.arange(seq_len - input_len, seq_len, device=device).unsqueeze(0)
-
-        if i == 0: 
-            mask = torch.ones_like(current_inputs, dtype=torch.bool)
-        else:
-            mask = torch.ones((inputs.shape[0], 1), dtype=torch.bool, device=device)
+        position_ids = torch.arange(0, seq_len, device=device)
 
         logits, past_key_values = model(current_inputs,
-                                        attention_mask = mask, use_cache = True,
-                                        past_key_values=past_key_values, return_hidden=True,
+                                        attention_mask = None, use_cache = False,
+                                        past_key_values=past_key_values, return_hidden=False,
                                         cache_position=position_ids)
 
-        new_logit = logits[:, -1]
-        # normalization needed
-        new_logit = F.normalize(new_logit, p = 2, dim = -1)
-        new_logit = torch.matmul(new_logit, embed_weight.t()) * 20
+        new_logit = logits[:, -1, :].clone()
+        new_logit = new_logit / math.sqrt(model.config.hidden_size)
+
+        if repetition_penalty != 1.0:
+            for b in range(generated_ids.shape[0]):
+                unique_tokens = torch.unique(generated_ids[b])
+                score = torch.gather(new_logit[b], 0, unique_tokens)
+                score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                new_logit[b].scatter_(0, unique_tokens, score)
+
+        # top-k
+        indices_to_remove = new_logit < torch.topk(new_logit, top_k)[0][..., -1, None]
+        new_logit[indices_to_remove] = float('-inf')
 
         if temperature != 1.0:
             new_logit /= temperature
