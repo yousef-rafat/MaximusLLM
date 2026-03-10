@@ -2,10 +2,10 @@
 
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-blue)](https://huggingface.co/yousefg/MaximusLLM)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Paper 1](https://img.shields.io/badge/ArXiv-MAXIS_Loss-B31B1B.svg)](#)
-[![Paper 2](https://img.shields.io/badge/ArXiv-RandNLA_Attention-B31B1B.svg)](#)
+[![Paper 1: MAXIS](https://img.shields.io/badge/SSRN-MAXIS_Loss-003366.svg)](#)
+[![Paper 2: RandNLA](https://img.shields.io/badge/SSRN-RandNLA_Attention-003366.svg)](#)
 
-**MaximusLLM** is a hyper-efficient paradigm for long-context LLMs: redifining model scaling and training through RandNLA Attention, MAXIS Loss, and Fisher-SVD.
+**MaximusLLM** is a highly efficient paradigm for long-context LLMs: redefining model scaling and training through RandNLA Attention, MAXIS Loss, and Fisher-SVD.
 
 By combining three novel mathematical breakthroughs, MaximusLLM achieves state-of-the-art efficiency without sacrificing convergence.
 
@@ -34,7 +34,7 @@ MaximusLLM is optimized for the only metric that matters: **how much the model l
 
 ### 1. MAXIS Loss
 **Matryoshka Accelerated X-entropy Inference-ready Sampling**
-(MAXIS) Loss transforms the model's embeddings into a hierarchical Matryoshka format as the knowledge is compressed into the 64 dimensions, allowing for much faster vector search and native RAG capabilities.
+(MAXIS) Loss transforms the model's embeddings into a hierarchical Matryoshka format, compressing knowledge into 64 dimensions to enable much faster vector search and native RAG capabilities.
 
 #### Strided Scouting
 
@@ -81,3 +81,27 @@ python example.py --prompt "Prompt Here..."
 ## License
 MaximusLLM is released under the **[MIT License](LICENSE)**. 
 Feel free to use, modify, and build upon this research.
+
+## Citation
+If you find this work useful in your research, please cite the following technical reports:
+
+#### MAXIS Loss
+```Bibtex
+@article{
+  gamaleldin2026maxis,
+  title={MAXIS: A Hyper-Efficient Paradigm for Scalable Long-Context LLM Training},
+  author={Gamaleldin, Yousef},
+  journal={SSRN: Artificial Intelligence eJournal},
+  year={2026},
+}
+```
+#### RandNLA Attention
+
+```Bibtex
+@article{
+  gamaleldin2026randnla,
+  title={Bifurcated Latent Attention: Scaling LLMs to Infinite Context via Asymmetric Causal RandNLA},
+  author={Gamaleldin, Yousef},
+  journal={SSRN: Artificial Intelligence eJournal},
+  year={2026},
+}
