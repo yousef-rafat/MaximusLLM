@@ -718,7 +718,7 @@ def main(local_rank, world_size):
                 enabled=True, device_type=f"cuda:{local_rank}", dtype=dtype
             ):  
                 if Settings.SFT_TRAINING:
-                    input_ids, lables = inputs
+                    input_ids, labels = inputs
                 else:
                     # pretraining + long context training
                     input_ids = inputs
