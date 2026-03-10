@@ -48,6 +48,7 @@ STABLE = TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY)
 SKIP_BLOCK_MASK = True
 if SKIP_BLOCK_MASK:
     LONG_CONTEXT_TRAINING = False
+    PACKING = True
 
 def lr_scheduler_fn(optimizer, min_lr=0.1):
     def scheduler(current_step):
@@ -585,7 +586,7 @@ def main(local_rank, world_size):
     # for muons stability, we init the model to fp32
     model = Model(config, device).float()
 
-    if LONG_CONTEXT_TRAINING:
+    if LONG_CONTEXT_TRAINING or SKIP_BLOCK_MASK:
         blockswap_attention_layers(model)
         model.use_custom_ckpt_fn = True
 
