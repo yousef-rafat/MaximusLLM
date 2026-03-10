@@ -37,15 +37,18 @@ USE_FAST_SOFTMAX = True
 LONG_CONTEXT_TRAINING = True
 MAX_LENGTH = 2048 if not LONG_CONTEXT_TRAINING else 8192
 ROPE_THETA = 10_000 if not LONG_CONTEXT_TRAINING else 100_000
-SAVE_EVERY_STEP = 10_000
+SAVE_EVERY_STEP = 110
 QAT_TRAINING = False
-ACCUM_STEPS = 21
+ACCUM_STEPS = 32
 TOTAL_NUMBER_OF_STEPS = 1_984 // ACCUM_STEPS
 PACKING = True if not LONG_CONTEXT_TRAINING else False
 WARMUP = max(30, TOTAL_NUMBER_OF_STEPS * 0.05) # stability
 DECAY = TOTAL_NUMBER_OF_STEPS * 0.1
 STABLE = TOTAL_NUMBER_OF_STEPS - (WARMUP + DECAY)
 SKIP_BLOCK_MASK = True
+
+# skip block mask bascially concat documents together with eos 
+# while allowing attention to look at previous documents
 if SKIP_BLOCK_MASK:
     LONG_CONTEXT_TRAINING = False
     PACKING = True
@@ -73,6 +76,9 @@ class Settings:
     loss_ema_beta = 0.95
     random_slice_prob = 0.3
     SFT_TRAINING=False
+    INSTRUCTION_TRAINING=True
+    if INSTRUCTION_TRAINING:
+        SFT_TRAINING = True
 
 
 class CUDAPreFetch:
@@ -303,21 +309,42 @@ class HFStreamDataset(IterableDataset):
 
         for item in ds_iterator:
             if Settings.SFT_TRAINING:
-                tokens = self.tokenizer(item["prompt"], add_special_tokens=False)["input_ids"]
-                labels = self.tokenizer(item[1]["content"], add_special_tokens=False)["input_ids"]
+                all_msg_tokens = []
+                all_msg_labels = []
+
+                for i, msg in enumerate(item["messages"]):
+                    role = msg["role"]
+                    content = msg["content"]
+                    
+                    if role == "user":
+                        text = f"<start_of_turn>user\n{content}<end_of_turn>\n"
+                        msg_toks = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+                        
+                        all_msg_tokens.extend(msg_toks)
+                        
+                        if Settings.INSTRUCTION_TRAINING:
+                            all_msg_labels.extend(msg_toks)
+                        else:
+                            all_msg_labels.extend([-100] * len(msg_toks))
+                            
+                    elif role == "model" or role == "assistant":
+                        text = f"<start_of_turn>model\n{content}<end_of_turn>\n"
+                        msg_toks = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+                        
+                        all_msg_tokens.extend(msg_toks)
+                        all_msg_labels.extend(msg_toks)
+
+                tokens = all_msg_tokens
+                labels = all_msg_labels
             else:
                 tokens = self.tokenizer(item["text"], add_special_tokens=False)["input_ids"]
+                tokens.append(self.eos_token)
 
             if PACKING and not LONG_CONTEXT_TRAINING:
                 if Settings.SFT_TRAINING:
-                    full_tokens = tokens + labels
-                    labels = (len(tokens) * [-100]) + labels + [self.eos_token]
                     buffer_labels.extend(labels)
-                    tokens = full_tokens
 
-                tokens.append(self.eos_token)
                 buffer.extend(tokens)
-
                 yield from do_pack()
             
             elif LONG_CONTEXT_TRAINING:
@@ -653,7 +680,7 @@ def main(local_rank, world_size):
         #model = torch.compile(model, fullgraph=True, mode="default")
         # avoid problems with custom autograd fn and compiling
         for i, block in enumerate(model.layers):
-            model.layers[i] = torch.compile(block, mode="default", fullgraph=True)
+            model.layers[i] = torch.compile(block, mode="default", fullgraph=not (LONG_CONTEXT_TRAINING or SKIP_BLOCK_MASK))
     else:
         model = model.to(device)
 
@@ -778,9 +805,13 @@ def main(local_rank, world_size):
         batch = next_batch
         step += 1
 
-        # TODO
-        if step % SAVE_EVERY_STEP == 0 and local_rank == 0:
-            save_model(get_raw_model(model), f"model_{step}.safetensors")
+        opt_step = (step + 1) // ACCUM_STEPS
+        if (step + 1) % ACCUM_STEPS == 0 and local_rank == 0:
+            if opt_step % SAVE_EVERY_STEP == 0:
+                print(f"saving checkpoint at update step {opt_step}...")
+                save_name = f"model_{opt_step}.safetensors"
+                save_model(get_raw_model(model), save_name)
+                update_model_hf(os.path.abspath(save_name), full_replace=True)
 
         if step == (TOTAL_NUMBER_OF_STEPS * ACCUM_STEPS):
             break
