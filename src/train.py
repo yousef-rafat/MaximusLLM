@@ -161,103 +161,63 @@ def get_packed_mask_and_pos_ids(input_ids, eos_token_id):
 class HFStreamDataset(IterableDataset):
     def __init__(
         self,
-        dataset_name: str = "HuggingFaceFW/fineweb-edu",
-        subset = "default",
+        dataset_name: str = "HuggingFaceH4/ultrachat_200k",
+        subset = "train_sft",
         rank=0,
         world_size=1,
-        files_to_skip=0
     ):
         self.dataset_name = dataset_name
         self.subset = subset
         self.rank = rank
         self.world_size = world_size
-        self.files_to_skip = files_to_skip
 
         self.tokenizer = AutoTokenizer.from_pretrained("yousefg/MaximusLLM")
         self.eos_token = self.tokenizer.eos_token_id or self.tokenizer.pad_token_id
         self.pad_token = self.tokenizer.pad_token_id
 
-        self.TOKENS_PER_FILE_EST = 500_000_000 
-        self.ROWS_PER_FILE_EST = 300_000 
-
-        tokens_processed = INDEX * Settings.batch_size * world_size * MAX_LENGTH
-        self.tokens_processed = tokens_processed
-
-        tokens_per_worker = tokens_processed / world_size
+        AVG_ROWS_PER_SEQ = 8196 // 2048 # conservative
+        APPROX_ROWS_PER_FILE = 15000 
         
-        self.files_per_worker_skipped = int(tokens_per_worker // self.TOKENS_PER_FILE_EST)
-        
-        # how far in the file
-        tokens_remainder = tokens_per_worker % self.TOKENS_PER_FILE_EST
-        percent_done = tokens_remainder / self.TOKENS_PER_FILE_EST
-        
-        self.rows_to_skip = int(percent_done * self.ROWS_PER_FILE_EST)
+        total_rows_global = INDEX * ACCUM_STEPS * (Settings.batch_size * world_size) * AVG_ROWS_PER_SEQ
+        self.global_files_to_skip = int(total_rows_global // APPROX_ROWS_PER_FILE)
+        print("skipping: ", total_rows_global)
 
-        if INDEX > 0 and self.rank == 0:
-            print(f"Resuming Step {INDEX} | Total Processed: {tokens_processed/1e9:.2f}B tokens")
-            print(f"Skipping {self.files_per_worker_skipped} full files per worker.")
-            print(f"Skipping first {self.rows_to_skip} rows in the active file.")
+        self.global_rows_to_skip_in_shard = int(total_rows_global % APPROX_ROWS_PER_FILE)
 
         try:
-            all_repo_files = list_repo_files(
-                dataset_name, 
-                repo_type="dataset",
-                token=None
-            )
-
-            self.all_files = []
-            for f in all_repo_files:
-                if f.endswith(".parquet") and f.startswith("data/"):
-                    self.all_files.append(f)
-            
-            self.all_files = sorted(self.all_files)
-
-            self.all_file_urls = [
+            all_repo_files = list_repo_files(dataset_name, repo_type="dataset")
+            self.all_file_urls = sorted([
                 f"https://huggingface.co/datasets/{dataset_name}/resolve/main/{f}" 
-                for f in self.all_files
-            ]
+                for f in all_repo_files if f.endswith(".parquet") and "data/" in f
+            ])
+            
+            if self.global_files_to_skip < len(self.all_file_urls):
+                self.remaining_urls = self.all_file_urls[self.global_files_to_skip:]
+            else:
+                self.remaining_urls = []
+                
         except Exception as e:
             print(f"Error fetching files: {e}")
-            self.all_file_urls = []
+            self.remaining_urls = []
 
     def __iter__(self):
         worker_info = get_worker_info()
-        if worker_info is None:
-            num_workers = 1
-            worker_id = 0
-        else:
-            num_workers = worker_info.num_workers
-            worker_id = worker_info.id
+        num_workers = worker_info.num_workers if worker_info else 1
+        worker_id = worker_info.id if worker_info else 0
 
         global_num_workers = self.world_size * num_workers
         global_worker_id = (self.rank * num_workers) + worker_id
-
-        # we shard the file urls between multiple workers
-        my_urls = self.all_file_urls[global_worker_id::global_num_workers]
-
-        if self.files_per_worker_skipped > 0:
-            if self.files_per_worker_skipped < len(my_urls):
-                my_urls = my_urls[self.files_per_worker_skipped:]
-            else:
-                print(f"[Rank {self.rank}] Worker {worker_id} has finished all assigned files.")
-                return
+        my_urls = self.remaining_urls[global_worker_id::global_num_workers]
 
         if not my_urls:
-            print(f"[Rank {self.rank} Worker {worker_id}] No files left to process.")
             return
 
-        print(f"[Rank {self.rank} Worker {worker_id}] Streaming {len(my_urls)} files...")
-
-        ds = load_dataset(
-            "parquet", 
-            data_files=my_urls, 
-            split="train", 
-            streaming=True
-        )
-
+        ds = load_dataset("parquet", data_files=my_urls, split="train", streaming=True)
         ds_iterator = iter(ds)
-        if self.rows_to_skip > 0:
-            ds_iterator = islice(ds_iterator, self.rows_to_skip, None)
+
+        if self.global_rows_to_skip_in_shard > 0:
+            local_skip = self.global_rows_to_skip_in_shard // global_num_workers
+            ds_iterator = islice(ds_iterator, local_skip, None)
 
         buffer = []
         batch = []
@@ -791,7 +751,7 @@ def main(local_rank, world_size):
                 smoothed_loss = true_loss
             smoothed_loss = Settings.loss_ema_beta * smoothed_loss + (1 - Settings.loss_ema_beta) * true_loss
 
-            if local_rank == 0 and ((step + 1) // ACCUM_STEPS) % 10 == 0:
+            if local_rank == 0 and ((step + 1) // ACCUM_STEPS) % 2 == 0:
                 print(
                     f"step {(step // ACCUM_STEPS):05d} | loss {(smoothed_loss):.4f}"
                 )
