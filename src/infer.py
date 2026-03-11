@@ -47,11 +47,10 @@ def general_generate_fn(model, inputs, tokenizer, max_new_tokens=50, temperature
     sample = None # <- error silencer
 
     for i in range(max_new_tokens):
-        current_inputs = inputs if i == 0 else sample
         seq_len = generated_ids.shape[1]
         position_ids = torch.arange(0, seq_len, device=device)
 
-        logits, past_key_values = model(current_inputs,
+        logits, past_key_values = model(generated_ids,
                                         attention_mask = None, use_cache = False,
                                         past_key_values=past_key_values, return_hidden=False,
                                         cache_position=position_ids)
@@ -67,8 +66,9 @@ def general_generate_fn(model, inputs, tokenizer, max_new_tokens=50, temperature
                 new_logit[b].scatter_(0, unique_tokens, score)
 
         # top-k
-        indices_to_remove = new_logit < torch.topk(new_logit, top_k)[0][..., -1, None]
-        new_logit[indices_to_remove] = float('-inf')
+        if top_k > 0:
+            indices_to_remove = new_logit < torch.topk(new_logit, top_k)[0][..., -1, None]
+            new_logit[indices_to_remove] = float('-inf')
 
         if temperature != 1.0:
             new_logit /= temperature
@@ -77,13 +77,14 @@ def general_generate_fn(model, inputs, tokenizer, max_new_tokens=50, temperature
         sample = torch.multinomial(probs, num_samples = 1)
         generated_ids = torch.cat([generated_ids, sample], dim = -1)
 
-        if sample.item() == tokenizer.eos_token:
+        if sample.item() == tokenizer.eos_token_id:
             break
     return generated_ids
 
 
 def test_general_talking(model, tokenizer, prompt=None, temperature = 1.0, device="cuda"):
     prompt = prompt or general_talking_prompt
-    tokens = tokenizer(prompt)["input_ids"]
+    formatted_prompt = f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+    tokens = tokenizer(formatted_prompt, add_special_tokens=False)["input_ids"]
     out = general_generate_fn(model, tokens, tokenizer, temperature=temperature, device=device)
     print(tokenizer.decode(out[0], skip_special_tokens = True))
