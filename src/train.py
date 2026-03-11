@@ -735,7 +735,7 @@ def main(local_rank, world_size):
 
                 eos_mask = (input_ids == eos_token)
                 if Settings.SFT_TRAINING:
-                    sft_mask = (labels[:, 1:] != -100).long().reshape(-1)
+                    sft_mask = (labels[:, 1:] != -100).reshape(-1)
                     loss_mask = (~eos_mask[:, :-1].reshape(-1)) & sft_mask
                 else:
                     loss_mask = ~eos_mask[:, :-1].reshape(-1)
