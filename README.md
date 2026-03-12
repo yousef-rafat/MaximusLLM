@@ -65,12 +65,23 @@ The background context is compressed using **Randomized Numerical Linear Algebra
 
 ---
 
+#### Throughput Persistence & Semantic Stability
+RandNLA fundamentally decouples computational speed from sequence length. MaximusLLM eliminates the "throughput collapse" typically observed in standard Transformers as context scales.
+
+*   **Constant-Time Throughput:** As shown in our benchmarks (Right), standard GQA throughput drops by over 60% at 8K context, while RandNLA maintains a near-constant speed of ~35,000 tokens per second.
+*   **Structural Regularization:** Most significantly, RandNLA achieves the **lowest validation loss** across all tested lengths (Left). By filtering high-signal tokens into the Detail path and compressing noise into the Sketch path, the architecture acts as a structural regularizer. This prevents the model from being overwhelmed by "contextual noise," resulting in superior semantic stability compared to even exact quadratic attention.
+
+---
+
 ## 3. Fisher SVD Initialization
 
 **Fisher SVD** initializes the latent spaces by leveraging the **Fisher Information Matrix**, approximated from the gradient signals of a small calibration dataset. By accumulating the squared gradients $\sum (\frac{\partial L}{\partial W})^2$, we identify which parameters are most critical to the model's semantic performance.
 
+---
+
 <img width="1589" height="985" alt="fisher_svd_vs_svd" src="https://github.com/user-attachments/assets/d6eb6b98-7ab5-4742-801d-2969236f81ba" />
 
+---
 As shown in the benchmarks, Fisher SVD significantly reduces semantic error compared to standard SVD, keeping the model's knowledge intact during architectural shifts.
 
 ## Project Scope
