@@ -20,6 +20,17 @@ By combining three novel mathematical breakthroughs, MaximusLLM achieves extreme
 **Matryoshka Accelerated X-entropy Inference-ready Sampling**
 (MAXIS) Loss transforms the model's embeddings into a hierarchical Matryoshka format, compressing knowledge into 64 dimensions to enable much faster vector search and native RAG capabilities.
 
+<img width="100%" alt="Maximus Benchmark" src="https://github.com/user-attachments/assets/f47083b5-03bc-4268-bb8a-22d287d1e3e5" />
+
+
+| Metric | Standard CE (Liger) | **MAXIS (Ours)** | **Improvement** |
+| :--- | :--- | :--- | :--- |
+| **Speed** | 0.16 steps/sec | **2.81 steps/sec** | **17.5x Faster** |
+| **Peak VRAM** | 13.66 GB | **8.37 GB** | **38.7% Reduction** |
+| **Convergence** | Baseline | **~96.4% Match** | **Near Lossless** |
+
+---
+
 #### Strided Scouting
 
 MAXIS utilizes a "scout" mechanism on a low-rank latent projection, using strided lookups (`[::stride]`) to identify the most difficult negative candidates across vocabulary chunks. This allows the model to "see" the entire vocabulary distribution with $\mathcal{O}(1)$ compute cost.
@@ -36,17 +47,6 @@ To match the accuracy of exact Cross-Entropy, MAXIS injects a Ghost Logit, a mat
 
 By training in a hierarchical format, Maximus natively optimizes knowledge into a $64$-dimensional latent space. This enables "Coarse-to-Fine" retrieval, allowing for $4\times$ faster vector search and native RAG capabilities directly from the transformer's hidden states.
 
----
-<img width="100%" alt="Maximus Benchmark" src="https://github.com/user-attachments/assets/f47083b5-03bc-4268-bb8a-22d287d1e3e5" />
-
-
-| Metric | Standard CE (Liger) | **MAXIS (Ours)** | **Improvement** |
-| :--- | :--- | :--- | :--- |
-| **Speed** | 0.16 steps/sec | **2.81 steps/sec** | **17.5x Faster** |
-| **Peak VRAM** | 13.66 GB | **8.37 GB** | **38.7% Reduction** |
-| **Convergence** | Baseline | **~96.4% Match** | **Near Lossless** |
-
----
 
 
 
