@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 import argparse
 import torch
 
-def main(prompt):
+def main(args):
     repo_id = "yousefg/MaximusLLM"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config = Config.from_pretrained(repo_id)
@@ -24,10 +24,11 @@ def main(prompt):
 
     tokenizer = AutoTokenizer.from_pretrained(repo_id)
 
-    test_general_talking(model, tokenizer, prompt=prompt, device=device)
+    test_general_talking(model, tokenizer, temperature=args.temperature, prompt=args.prompt, device=device)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--prompt', type=str, help='The prompt message to use.')
+    parser.add_argument('--temperature', type=float, min=0, help='The temperature for the logits')
     args = parser.parse_args()
-    main(args.prompt)
+    main(args)
