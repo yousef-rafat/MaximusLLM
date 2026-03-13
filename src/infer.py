@@ -31,7 +31,7 @@ Introduce yourself in one short sentence and say one helpful tip about learning 
 """
 
 @torch.inference_mode()
-def general_generate_fn(model, inputs, tokenizer, max_new_tokens=50, temperature=1.0, device="cuda", repetition_penalty=1.2, top_k=50):
+def general_generate_fn(model, inputs, tokenizer, args, device="cuda"):
 
     if not isinstance(inputs, torch.Tensor):
         inputs = torch.tensor(inputs)
@@ -46,7 +46,7 @@ def general_generate_fn(model, inputs, tokenizer, max_new_tokens=50, temperature
     past_key_values = None
     sample = None # <- error silencer
 
-    for i in range(max_new_tokens):
+    for i in range(args.max_new_tokens):
         seq_len = generated_ids.shape[1]
         position_ids = torch.arange(0, seq_len, device=device)
 
@@ -58,20 +58,20 @@ def general_generate_fn(model, inputs, tokenizer, max_new_tokens=50, temperature
         new_logit = logits[:, -1, :].clone()
         new_logit = new_logit / math.sqrt(model.config.hidden_size)
 
-        if repetition_penalty != 1.0:
+        if args.repetition_penalty != 1.0:
             for b in range(generated_ids.shape[0]):
                 unique_tokens = torch.unique(generated_ids[b])
                 score = torch.gather(new_logit[b], 0, unique_tokens)
-                score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                score = torch.where(score < 0, score * args.repetition_penalty, score / args.repetition_penalty)
                 new_logit[b].scatter_(0, unique_tokens, score)
 
         # top-k
-        if top_k > 0:
-            indices_to_remove = new_logit < torch.topk(new_logit, top_k)[0][..., -1, None]
+        if args.top_k > 0:
+            indices_to_remove = new_logit < torch.topk(new_logit, args.top_k)[0][..., -1, None]
             new_logit[indices_to_remove] = float('-inf')
 
-        if temperature != 1.0:
-            new_logit /= temperature
+        if args.temperature != 1.0:
+            new_logit /= args.temperature
 
         probs = F.softmax(new_logit, dim = -1)
         sample = torch.multinomial(probs, num_samples = 1)
@@ -82,9 +82,12 @@ def general_generate_fn(model, inputs, tokenizer, max_new_tokens=50, temperature
     return generated_ids
 
 
-def test_general_talking(model, tokenizer, prompt=None, temperature = 1.0, device="cuda"):
+def test_general_talking(model, tokenizer, args, prompt=None, device="cuda"):
     prompt = prompt or general_talking_prompt
-    formatted_prompt = f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+    if not args.ignore_persona:
+        formatted_prompt = f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+    else:
+        formatted_prompt = prompt
     tokens = tokenizer(formatted_prompt, add_special_tokens=False)["input_ids"]
-    out = general_generate_fn(model, tokens, tokenizer, temperature=temperature, device=device)
+    out = general_generate_fn(model, tokens, tokenizer, args=args, device=device)
     print(tokenizer.decode(out[0], skip_special_tokens = True))
