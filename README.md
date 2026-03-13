@@ -1,18 +1,16 @@
-# MaximusLLM: The Hyper-Efficient Long-Context Engine
+# MaximusLLM: Hyper-Efficient Paradigm for Long-Context LLMs
 
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-blue)](https://huggingface.co/yousefg/MaximusLLM)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Paper 1: MAXIS](https://img.shields.io/badge/SSRN-MAXIS_Loss-003366.svg)](#)
 [![Paper 2: RandNLA](https://img.shields.io/badge/SSRN-RandNLA_Attention-003366.svg)](#)
 
-**MaximusLLM** is a highly efficient paradigm for long-context LLMs: redefining model scaling and training through RandNLA Attention, MAXIS Loss, and Fisher-SVD.
-
-By combining three novel mathematical breakthroughs, MaximusLLM achieves extreme efficiency and speed without sacrificing accuracy or convergence.
+**MaximusLLM** is a paradigm for long-context language modeling that decouples computational cost from sequence length and vocabulary size. By integrating **RandNLA Attention**, **MAXIS Loss**, and **Fisher-SVD**, the architecture addresses $O(N^2)$ and $O(V)$ scaling bottlenecks to provide a high-throughput alternative to standard Transformer objectives.
 
 ### The TL;DR
-* **17.5x Faster Training** vs. standard Cross-Entropy.
-* **Infinite-Horizon Context** via Random Linear Algebra Latent Attention.
-* **39% Less VRAM** usage during training.
+* **17.5x Faster Training** (and 38% lighter) via MAXIS Loss compared to Cross Entropy.
+* **Infinite-Horizon Context** with constant-time throughput via Random Latent Attention.
+* **Inference-Ready RAG** with lossless fact retrieval via hierarchical Matryoshka embeddings.
 
 # The Maximus Architecture
 
