@@ -43,17 +43,13 @@ def general_generate_fn(model, inputs, tokenizer, args, device="cuda"):
     
     inputs = torch.cat([torch.tensor([[tokenizer.bos_token_id]], device=device), inputs], dim=1)
     generated_ids = inputs.clone()
-    past_key_values = None
     sample = None # <- error silencer
 
     for i in range(args.max_new_tokens):
         seq_len = generated_ids.shape[1]
-        position_ids = torch.arange(0, seq_len, device=device)
+        position_ids = torch.arange(0, seq_len, device=device).unsqueeze(0)
 
-        logits, past_key_values = model(generated_ids,
-                                        attention_mask = None, use_cache = False,
-                                        past_key_values=past_key_values, return_hidden=False,
-                                        cache_position=position_ids)
+        logits = model(generated_ids, attention_mask = None, cache_position=position_ids)
 
         new_logit = logits[:, -1, :].clone()
         new_logit = new_logit / math.sqrt(model.config.hidden_size)
@@ -66,8 +62,8 @@ def general_generate_fn(model, inputs, tokenizer, args, device="cuda"):
                 new_logit[b].scatter_(0, unique_tokens, score)
 
         # top-k
-        if args.top_k > 0:
-            indices_to_remove = new_logit < torch.topk(new_logit, args.top_k)[0][..., -1, None]
+        if args.topk > 0:
+            indices_to_remove = new_logit < torch.topk(new_logit, args.topk)[0][..., -1, None]
             new_logit[indices_to_remove] = float('-inf')
 
         if args.temperature != 1.0:
