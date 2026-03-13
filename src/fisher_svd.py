@@ -4,7 +4,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 from datasets import load_dataset
 
-token = "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"
+token = ""
 model_id = "google/gemma-3-270m"
 
 NUM_CALIBRATION_BATCHES = 16 
