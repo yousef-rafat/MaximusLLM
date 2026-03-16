@@ -49,9 +49,16 @@ By training in a hierarchical format, Maximus natively optimizes knowledge into 
 
 
 ## 2. RandNLA Latent Attention
+Traditional attention is $O(N^2)$. **RandNLA Attention** splits the memory into two mathematically distinct paths to achieve $O(N \cdot K)$ complexity without sacrificing discrete recall.
+
 <img width="2190" height="590" alt="randnla_gqa_lin" src="https://github.com/user-attachments/assets/d7dd0fe1-e3a2-406b-a5a0-3bf29822f520" />
 
-Traditional attention is $O(N^2)$. **RandNLA Attention** splits the memory into two mathematically distinct paths to achieve $O(N \cdot K)$ complexity without sacrificing discrete recall.
+
+| Metric | Standard Attention | **RandNLA (Ours)** | **Advantage** |
+| :--- | :--- | :--- | :--- |
+| **Inference Latency** | 0.539s | **0.233s** | **2.3x Faster** |
+| **NLL Loss** | 59.17 | **55.99** | **3.18 lower loss** |
+| **Complexity** | Quadratic $\mathcal{O}(N^2)$ | **Linear $\mathcal{O}(N \cdot K)$** | **Flat Throughput** |
 
 #### The Detail Path (Top-K)
 A dynamic `importance_scorer` identifies the most critical tokens in the sequence and routes them to a high-resolution, uncompressed KV-cache. This ensures that the model maintains perfect recall for specific facts, names, and variables, bypassing the "blurry recall" of purely linear models.
