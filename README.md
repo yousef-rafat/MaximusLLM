@@ -2,8 +2,8 @@
 
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-blue)](https://huggingface.co/yousefg/MaximusLLM)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Paper 1: MAXIS](https://img.shields.io/badge/SSRN-MAXIS_Loss-003366.svg)](https://yousef-rafat.github.io/MaximusLLM/maxis.pdf)
-[![Paper 2: RandNLA](https://img.shields.io/badge/SSRN-RandNLA_Attention-003366.svg)](https://yousef-rafat.github.io/MaximusLLM/randnla.pdf)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19096251.svg)](https://doi.org/10.5281/zenodo.19096251)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19096628.svg)](https://doi.org/10.5281/zenodo.19096628)
 
 **MaximusLLM** is a paradigm for long-context language modeling that decouples computational cost from sequence length and vocabulary size. By integrating **RandNLA Attention**, **MAXIS Loss**, and **Fisher-SVD**, the architecture addresses $O(N^2)$ and $O(V)$ scaling bottlenecks to provide a high-throughput alternative to standard Transformer objectives.
 
