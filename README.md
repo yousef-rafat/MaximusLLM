@@ -111,21 +111,25 @@ If you find this work useful in your research, please cite the following technic
 
 #### MAXIS Loss
 ```Bibtex
-@article{
-  gamaleldin2026maxis,
-  title={MAXIS: A Hyper-Efficient Paradigm for Scalable Long-Context LLM Training},
-  author={Gamaleldin, Yousef},
-  journal={SSRN: Artificial Intelligence eJournal},
-  year={2026},
+@article{gamaleldin2026maxis,
+  author    = {Yousef Gamaleldin},
+  title     = {MAXIS: A Hyper-Efficient Paradigm for Scalable Long-Context LLM Training},
+  journal   = {Zenodo},
+  year      = {2026},
+  doi       = {10.5281/zenodo.19096251},
+  url       = {https://doi.org/10.5281/zenodo.19096251},
+  license   = {CC-BY-4.0}
 }
 ```
 #### RandNLA Attention
 
 ```Bibtex
-@article{
-  gamaleldin2026randnla,
-  title={Bifurcated Latent Attention: Scaling LLMs to Infinite Context via Asymmetric Causal RandNLA},
-  author={Gamaleldin, Yousef},
-  journal={SSRN: Artificial Intelligence eJournal},
-  year={2026},
+@article{gamaleldin2026bifurcated,
+  author    = {Yousef Gamaleldin},
+  title     = {Bifurcated Latent Attention: Scaling LLMs to Infinite Context via Asymmetric Causal RandNLA},
+  journal   = {Zenodo},
+  year      = {2026},
+  doi       = {10.5281/zenodo.19096628},
+  url       = {https://doi.org/10.5281/zenodo.19096628},
+  license   = {CC-BY-4.0}
 }
