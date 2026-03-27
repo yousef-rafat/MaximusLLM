@@ -1,4 +1,5 @@
 # MaximusLLM: Hyper-Efficient Paradigm for Long-Context LLMs
+<img width="1920" height="509" alt="MaximusLogoSimple_ManimCE_v0 20 1" src="https://github.com/user-attachments/assets/806a9ea9-dd95-472a-aadf-eecfb1e62c64" />
 
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-blue)](https://huggingface.co/yousefg/MaximusLLM)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
