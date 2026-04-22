@@ -1,7 +1,10 @@
 import json
 import torch
-import torch.nn as nn
 import time
+import random
+import os
+import torch.nn as nn
+import numpy as np
 import matplotlib.pyplot as plt
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -10,24 +13,44 @@ from train import MatryoshkaSampledSoftmaxLoss
 
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
-# configure to be 40m approx.
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+SCALING_CONFIGS = [
+    {"name": "180M", "h": 512,  "layers": 8,  "heads": 8},
+    {"name": "440M", "h": 1024, "layers": 12, "heads": 16},
+    {"name": "880M", "h": 1536, "layers": 16, "heads": 24},
+    {"name": "1.5B", "h": 2048, "layers": 19, "heads": 32},
+]
+
+SEEDS = [42, 123, 999, 2035]
+
 repo_id = "yousefg/MaximusLLM"
 config = Config.from_pretrained(repo_id)
 
-config.hidden_size = 384
-config.intermediate_size = 1024
-config.num_hidden_layers = 6
-config.num_attention_heads = 6
-config.head_dim = 64
-config.vocab_size = 262144
-
-SAMPLES_TO_TRAIN = 4000
+SAMPLES_TO_TRAIN = 2000
 BATCH_SIZE = 8
-SEQ_LEN = 512 
+SEQ_LEN = 1024
 DEVICE = "cuda"
-EVAL_INTERVAL = 25
+EVAL_INTERVAL = 100
 
-torch.set_default_dtype(torch.float32)
+def set_seed(seed: int):
+    if seed is None:
+        print("SEED IS NONE!", flush=True)
+        return
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    print(f"Fixed seed set to: {seed}")
 
 tokenizer = AutoTokenizer.from_pretrained(repo_id)
 dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
@@ -61,14 +84,20 @@ print(f">>> Loaded {len(train_buffer)} Training Batches.")
 
 
 # for validation we will run cross entropy for both of them to ensure fairness
-def run_experiment(name, loss_type):
+def run_experiment(name, loss_type, seed):
+    set_seed(seed)
+
     print("\n======================================")
     print(f"STARTING RUN: {name}")
     print("======================================")
-    
-    model = Model(config, DEVICE).to(torch.float32)
+    model = Model(config, DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     model.to(DEVICE)
+    try:
+        compiled_model = torch.compile(model)
+        model = compiled_model
+    except Exception:
+        pass
     
     if loss_type == "liger":
         if LigerFusedLinearCrossEntropyLoss:
@@ -121,7 +150,7 @@ def run_experiment(name, loss_type):
             with torch.no_grad():
                 for v_in in val_buffer:
                     v_in = v_in.to(DEVICE, dtype=torch.long, non_blocking=True)
-                    with torch.amp.autocast(device_type="cuda", enabled=True, dtype=torch.float16):
+                    with torch.amp.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
                         v_h = model(v_in, attention_mask=None, return_hidden=True)
                         logits = torch.matmul(v_h, model.embed_tokens.weight.t())
                     
@@ -148,12 +177,25 @@ def run_experiment(name, loss_type):
     
     return steps, times, val_losses, peak_vram, avg_speed
 
-steps_l, time_l, val_l, vram_l, speed_l = run_experiment("Liger (Standard)", "liger")
-steps_m, time_m, val_m, vram_m, speed_m = run_experiment("MAXIS (Yours)", "maxis")
+all_results = {}
+for i, conf in enumerate(SCALING_CONFIGS):
+    config.hidden_size = conf["h"]
+    config.num_hidden_layers = conf["layers"]
+    config.num_attention_heads = conf["heads"]
+    config.intermediate_size = conf["h"] * 4
+    
+    sl, tl, vl, vraml, speedl = run_experiment(f"{conf['name']}-Liger", "liger", seed=SEEDS[i])
+    sm, tm, vm, vramm, speedm = run_experiment(f"{conf['name']}-MAXIS", "maxis")
+    
+    all_results[conf["name"]] = {
+        "liger": {"steps": sl, "time": tl, "val": vl, "vram": vraml, "speed": speedl},
+        "maxis": {"steps": sm, "time": tm, "val": vm, "vram": vramm, "speed": speedm}
+    }
 
 def plot_results():
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    
+    steps_l, time_l, val_l, vram_l, speed_l = all_results["1.5B"]["liger"]
+    steps_m, time_m, val_m, vram_m, speed_m = all_results["1.5B"]["maxis"]
     # due to embedding scaling inherient in the model
     target_start_loss = 12.5 
     scaling_factor = val_l[0] / target_start_loss
@@ -199,22 +241,6 @@ def plot_results():
 
 plot_results()
 
-results = {
-    "cross_entropy": {
-        "steps": steps_l,
-        "time": time_l,
-        "val": val_l,
-        "vram": vram_l,
-        "speed": speed_l
-    },
-    "maxis": {
-        "steps": steps_m,
-        "time": time_m,
-        "val": val_m,
-        "vram": vram_m,
-        "speed": speed_m
-    }
-}
-
 with open("loss_results.json", "w") as f:
-    json.dump(results, f, indent=4)
+    json.dump(all_results, f, indent=4)
+

@@ -9,21 +9,31 @@ import torch.nn.functional as F
 from lora import blockswap_attention_layers
 from train import MatryoshkaSampledSoftmaxLoss
 import torch.nn as nn
+from ablation_mat import set_seed
 
-SEQ_LENS = [1024, 2048, 4096, 8192, 16384]
-BATCH_SIZE = 2
-DEVICE = "cuda"
-torch.set_default_device(DEVICE)
+SEQ_LENS = [2048, 4096, 8192, 16384, 32768]
+
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+SCALING_CONFIGS = [
+    {"name": "180M", "h": 512,  "layers": 8,  "heads": 8},
+    {"name": "440M", "h": 1024, "layers": 12, "heads": 16},
+    {"name": "880M", "h": 1536, "layers": 16, "heads": 24},
+    {"name": "1.5B", "h": 2048, "layers": 19, "heads": 32},
+]
+
+SEEDS = [42, 123, 999, 2035]
 
 REPO_ID = "yousefg/MaximusLLM"
-
 config = Config.from_pretrained(REPO_ID)
-config.hidden_size = 384
-config.intermediate_size = 1024
-config.num_hidden_layers = 4
-config.num_attention_heads = 6
-config.head_dim = 64
-config.vocab_size = 262144
+
+SAMPLES_TO_TRAIN = 2000
+BATCH_SIZE = 8
+SEQ_LEN = 1024
+DEVICE = "cuda"
+EVAL_INTERVAL = 100
 
 tokenizer = AutoTokenizer.from_pretrained(REPO_ID)
 dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
@@ -85,7 +95,8 @@ def setup_sliding_window(model, window_size=1024):
 def setup_randnla(model):
     blockswap_attention_layers(model)
 
-def run_ablation(name, setup_fn, train_steps=1000):
+def run_ablation(name, setup_fn, train_steps=1000, seed=None):
+    set_seed(seed)
     print(f"\n{'='*40}\nRUNNING: {name}\n{'='*40}")
     results = {"vram": [], "speed": [], "ppl":[]}
 
@@ -93,9 +104,14 @@ def run_ablation(name, setup_fn, train_steps=1000):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        model = Model(config, DEVICE, enabled_lm_head=True).to(torch.float32)
+        model = Model(config, DEVICE, enabled_lm_head=True)
         setup_fn(model)
         model.train()
+        try:
+            compiled_model = torch.compile(model)
+            model = compiled_model
+        except Exception:
+            pass
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         train_fn = MatryoshkaSampledSoftmaxLoss(
@@ -110,7 +126,7 @@ def run_ablation(name, setup_fn, train_steps=1000):
                     break
                 
                 optimizer.zero_grad()
-                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                     hidden = model(batch, attention_mask = None, return_hidden = True)
                     h_shift = hidden[:, :-1, :].reshape(-1, config.hidden_size)
                     t_shift = batch[:, 1:].reshape(-1)
@@ -162,11 +178,28 @@ def run_ablation(name, setup_fn, train_steps=1000):
 
     return results
 
-res_std = run_ablation("GQA (Quadratic)", setup_standard)
-res_lin = run_ablation("Linear (Pure Compression)", setup_sliding_window)
-res_rnd = run_ablation("RandNLA (Bifurcated)", setup_randnla)
+all_results = {}
+for i, conf in enumerate(SCALING_CONFIGS):
+    # Update current configuration size
+    config.hidden_size = conf["h"]
+    config.num_hidden_layers = conf["layers"]
+    config.num_attention_heads = conf["heads"]
+    config.intermediate_size = conf["h"] * 4
+    
+    # 1. Run Attention Ablations for this specific size
+    res_std = run_ablation(f"{conf['name']}-GQA", setup_standard, seed = SEEDS[i])
+    res_lin = run_ablation(f"{conf['name']}-SWA", setup_sliding_window, seed = SEEDS[i])
+    res_rnd = run_ablation(f"{conf['name']}-RandNLA", setup_randnla, seed = SEEDS[i])
+    
+    all_results[conf["name"]] = {
+        "standard": res_std,
+        "linear": res_lin,
+        "randnla": res_rnd
+    }
+
 
 def plot_ablation():
+    res_std, res_lin, res_rnd = all_results["1.5B"]
     _, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(22, 6))
     
     def to_loss(ppl_list):
@@ -213,23 +246,5 @@ def plot_ablation():
 
 plot_ablation()
 
-results = {
-    "standard_attention": {
-        "perplexity": res_std["ppl"],
-        "vram": res_std["vram"],
-        "speed": res_std["speed"],
-    },
-    "linear_attention": {
-        "perplexity": res_lin["ppl"],
-        "vram": res_lin["vram"],
-        "speed": res_lin["speed"],
-    },
-    "randnla_attention": {
-        "perplexity": res_rnd["ppl"],
-        "vram": res_rnd["vram"],
-        "speed": res_rnd["speed"],
-    },
-}
-
 with open("loss_results.json", "w") as f:
-    json.dump(results, f, indent=4)
+    json.dump(all_results, f, indent=4)
