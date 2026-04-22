@@ -2,8 +2,8 @@
 
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-blue)](https://huggingface.co/yousefg/MaximusLLM)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Paper 1: MAXIS](https://img.shields.io/badge/SSRN-MAXIS_Loss-003366.svg)](#)
-[![Paper 2: RandNLA](https://img.shields.io/badge/SSRN-RandNLA_Attention-003366.svg)](#)
+[![DOI](https://zenodo.org/badge/DOI/MAXIS.19096251.svg)](https://doi.org/10.5281/zenodo.19096251)
+[![DOI](https://zenodo.org/badge/DOI/RandNLA.19096628.svg)](https://doi.org/10.5281/zenodo.19096628)
 
 **MaximusLLM** is a paradigm for long-context language modeling that decouples computational cost from sequence length and vocabulary size. By integrating **RandNLA Attention**, **MAXIS Loss**, and **Fisher-SVD**, the architecture addresses $O(N^2)$ and $O(V)$ scaling bottlenecks to provide a high-throughput alternative to standard Transformer objectives.
 
@@ -49,9 +49,16 @@ By training in a hierarchical format, Maximus natively optimizes knowledge into 
 
 
 ## 2. RandNLA Latent Attention
+Traditional attention is $O(N^2)$. **RandNLA Attention** splits the memory into two mathematically distinct paths to achieve $O(N \cdot K)$ complexity without sacrificing discrete recall.
+
 <img width="2190" height="590" alt="randnla_gqa_lin" src="https://github.com/user-attachments/assets/d7dd0fe1-e3a2-406b-a5a0-3bf29822f520" />
 
-Traditional attention is $O(N^2)$. **RandNLA Attention** splits the memory into two mathematically distinct paths to achieve $O(N \cdot K)$ complexity without sacrificing discrete recall.
+
+| Metric | Standard Attention | **RandNLA (Ours)** | **Advantage** |
+| :--- | :--- | :--- | :--- |
+| **Inference Latency** | 0.539s | **0.233s** | **2.3x Faster** |
+| **NLL Loss** | 59.17 | **55.99** | **3.18 lower loss** |
+| **Complexity** | Quadratic $\mathcal{O}(N^2)$ | **Linear $\mathcal{O}(N \cdot K)$** | **Flat Throughput** |
 
 #### The Detail Path (Top-K)
 A dynamic `importance_scorer` identifies the most critical tokens in the sequence and routes them to a high-resolution, uncompressed KV-cache. This ensures that the model maintains perfect recall for specific facts, names, and variables, bypassing the "blurry recall" of purely linear models.
@@ -104,21 +111,25 @@ If you find this work useful in your research, please cite the following technic
 
 #### MAXIS Loss
 ```Bibtex
-@article{
-  gamaleldin2026maxis,
-  title={MAXIS: A Hyper-Efficient Paradigm for Scalable Long-Context LLM Training},
-  author={Gamaleldin, Yousef},
-  journal={SSRN: Artificial Intelligence eJournal},
-  year={2026},
+@article{gamaleldin2026maxis,
+  author    = {Yousef Gamaleldin},
+  title     = {MAXIS: A Hyper-Efficient Paradigm for Scalable Long-Context LLM Training},
+  journal   = {Zenodo},
+  year      = {2026},
+  doi       = {10.5281/zenodo.19096251},
+  url       = {https://doi.org/10.5281/zenodo.19096251},
+  license   = {CC-BY-4.0}
 }
 ```
 #### RandNLA Attention
 
 ```Bibtex
-@article{
-  gamaleldin2026randnla,
-  title={Bifurcated Latent Attention: Scaling LLMs to Infinite Context via Asymmetric Causal RandNLA},
-  author={Gamaleldin, Yousef},
-  journal={SSRN: Artificial Intelligence eJournal},
-  year={2026},
+@article{gamaleldin2026bifurcated,
+  author    = {Yousef Gamaleldin},
+  title     = {Bifurcated Latent Attention: Scaling LLMs to Infinite Context via Asymmetric Causal RandNLA},
+  journal   = {Zenodo},
+  year      = {2026},
+  doi       = {10.5281/zenodo.19096628},
+  url       = {https://doi.org/10.5281/zenodo.19096628},
+  license   = {CC-BY-4.0}
 }
