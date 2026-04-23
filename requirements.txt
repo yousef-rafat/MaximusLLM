@@ -1,4 +1,4 @@
-torch>=2.90
+torch>=2.9.0
 transformers
 huggingface_hub==0.19.4
 safetensors
