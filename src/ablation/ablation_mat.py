@@ -93,6 +93,7 @@ def run_experiment(name, loss_type, seed):
     model = Model(config, DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     model.to(DEVICE)
+    model.gradient_checkpointing = True
 
     if loss_type == "liger":
         if LigerFusedLinearCrossEntropyLoss:
