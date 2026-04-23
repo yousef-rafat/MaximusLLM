@@ -107,11 +107,6 @@ def run_ablation(name, setup_fn, train_steps=1000, seed=None):
         model = Model(config, DEVICE, enabled_lm_head=True)
         setup_fn(model)
         model.train()
-        try:
-            compiled_model = torch.compile(model)
-            model = compiled_model
-        except Exception:
-            pass
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         train_fn = MatryoshkaSampledSoftmaxLoss(

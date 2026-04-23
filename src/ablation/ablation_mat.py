@@ -93,12 +93,7 @@ def run_experiment(name, loss_type, seed):
     model = Model(config, DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     model.to(DEVICE)
-    try:
-        compiled_model = torch.compile(model)
-        model = compiled_model
-    except Exception:
-        pass
-    
+
     if loss_type == "liger":
         if LigerFusedLinearCrossEntropyLoss:
             train_fn = LigerFusedLinearCrossEntropyLoss()
