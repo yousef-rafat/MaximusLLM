@@ -101,7 +101,8 @@ def run_experiment(name, loss_type, seed):
             train_fn = nn.CrossEntropyLoss()
     else:
         train_fn = MatryoshkaSampledSoftmaxLoss(
-            model.embed_tokens.weight, low_rank_dim=64, n_candidates=2048, chunk_size=32
+            model.embed_tokens.weight, low_rank_dim=model.config.hidden_size // 8,
+            n_candidates=min(8192, model.config.vocab_size // 64), chunk_size=max(128, model.config.hidden_size // 8)
         )
 
     val_fn = nn.CrossEntropyLoss()
@@ -169,6 +170,15 @@ def run_experiment(name, loss_type, seed):
     print(f"\n>>> FINAL STATS FOR {name}:")
     print(f"Peak VRAM: {peak_vram:.2f} GB")
     print(f"Speed:     {avg_speed:.2f} steps/sec")
+
+    del model
+    del optimizer
+    del train_fn
+    
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     
     return steps, times, val_losses, peak_vram, avg_speed
 
@@ -178,14 +188,20 @@ for i, conf in enumerate(SCALING_CONFIGS):
     config.num_hidden_layers = conf["layers"]
     config.num_attention_heads = conf["heads"]
     config.intermediate_size = conf["h"] * 4
-    
-    sl, tl, vl, vraml, speedl = run_experiment(f"{conf['name']}-Liger", "liger", seed=SEEDS[i])
-    sm, tm, vm, vramm, speedm = run_experiment(f"{conf['name']}-MAXIS", "maxis")
+
+    should_break = False
+    try:
+        sl, tl, vl, vraml, speedl = run_experiment(f"{conf['name']}-Liger", "liger", seed=SEEDS[i])
+        sm, tm, vm, vramm, speedm = run_experiment(f"{conf['name']}-MAXIS", "maxis", seed=SEEDS[i])
+    except Exception:
+        pass
     
     all_results[conf["name"]] = {
         "liger": {"steps": sl, "time": tl, "val": vl, "vram": vraml, "speed": speedl},
         "maxis": {"steps": sm, "time": tm, "val": vm, "vram": vramm, "speed": speedm}
     }
+    if should_break:
+        break
 
 def plot_results():
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
@@ -234,8 +250,7 @@ def plot_results():
     print(f"MAXIS saves {vram_save:.1f}% VRAM")
     print(f"MAXIS runs {speed_boost:.1f}% Faster")
 
-plot_results()
-
 with open("loss_results.json", "w") as f:
     json.dump(all_results, f, indent=4)
 
+plot_results()

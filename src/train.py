@@ -452,8 +452,6 @@ class MatryoshkaManualFunction(torch.autograd.Function):
             saved_chunks.append((
                 curr_h_f, curr_t_ids, top_indices, 
                 log_p_m.exp().to(dtype), log_p_a.exp().to(dtype), 
-                w_f_pos, w_f_cand, w_l_pos, w_l_cand,
-                logits_m, logits_a
             ))
 
         ctx.save_for_backward(hidden_states, embedding_weight)
@@ -479,12 +477,12 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         grad_embed_low = grad_embed[:, :ctx.low_rank_dim]
 
         for i, chunk in enumerate(ctx.saved_chunks):
-            (h_f, t_ids, top_idx, p_m, p_a, w_fp, w_fc, w_lp, w_lc, l_m, l_a) = chunk
+            (h_f, t_ids, top_idx, p_m, p_a) = chunk
 
-            w_fp = w_fp.to(dtype)
-            w_fc = w_fc.to(dtype)
-            w_lp = w_lp.to(dtype)
-            w_lc = w_lc.to(dtype)
+            w_fp = embedding_weight[t_ids].to(dtype)
+            w_fc = embedding_weight[top_idx].to(dtype)
+            w_lp = w_fp[:, :ctx.low_rank_dim]
+            w_lc = w_fc[:, :ctx.low_rank_dim]
             
             # index 0 = label
             # CE gradient = (softmax - label)
