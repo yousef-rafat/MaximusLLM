@@ -1,6 +1,5 @@
 import json
 import torch
-import time
 import random
 import os
 import torch.nn as nn
@@ -115,12 +114,13 @@ def run_experiment(name, loss_type, seed):
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
     
-    accumulated_train_time = 0.0
-    
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    accumulated_loss_time = 0.0
+    peak_vram = 0.0
     for step, inputs in enumerate(train_buffer):
         inputs = inputs.to(device=DEVICE, dtype=torch.long, non_blocking=True)
         
-        t0 = time.time()
         model.train()
         optimizer.zero_grad()
 
@@ -128,16 +128,24 @@ def run_experiment(name, loss_type, seed):
             hidden = model(inputs, attention_mask=None, return_hidden=True)
             h_shift = hidden[:, :-1, :].reshape(-1, config.hidden_size)
             t_shift = inputs[:, 1:].reshape(-1)
+
+            if step == 2:
+                torch.cuda.reset_peak_memory_stats()
         
+            start_event.record()
             if loss_type == "liger":
                 loss = train_fn(model.embed_tokens.weight, h_shift, t_shift)
             else:
                 loss = train_fn(h_shift, t_shift)
             
-        loss.backward()
+            loss.backward()
+            end_event.record()
+
+            if step == 2:
+                peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
         optimizer.step()
         torch.cuda.synchronize()
-        accumulated_train_time += (time.time() - t0)
+        accumulated_loss_time += start_event.elapsed_time(end_event) / 1000.0
         
         if step % EVAL_INTERVAL == 0 or step == len(train_buffer) - 1:
             del hidden, h_shift
@@ -159,14 +167,13 @@ def run_experiment(name, loss_type, seed):
                     total_val_loss += v_loss.item()
             
             avg_val_loss = total_val_loss / len(val_buffer)
-            print(f"Step {step} | Train Time: {accumulated_train_time:.1f}s | Val Loss: {avg_val_loss:.4f}")
+            print(f"Step {step} | Train Time: {accumulated_loss_time:.1f}s | Val Loss: {avg_val_loss:.4f}")
             
             steps.append(step)
-            times.append(accumulated_train_time)
+            times.append(accumulated_loss_time)
             val_losses.append(avg_val_loss)
 
-    peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
-    avg_speed = len(train_buffer) / accumulated_train_time
+    avg_speed = len(train_buffer) / accumulated_loss_time
     
     print(f"\n>>> FINAL STATS FOR {name}:")
     print(f"Peak VRAM: {peak_vram:.2f} GB")
@@ -194,7 +201,8 @@ for i, conf in enumerate(SCALING_CONFIGS):
     try:
         sl, tl, vl, vraml, speedl = run_experiment(f"{conf['name']}-Liger", "liger", seed=SEEDS[i])
         sm, tm, vm, vramm, speedm = run_experiment(f"{conf['name']}-MAXIS", "maxis", seed=SEEDS[i])
-    except Exception:
+    except Exception as e:
+        print(e, flush=True)
         pass
     
     all_results[conf["name"]] = {

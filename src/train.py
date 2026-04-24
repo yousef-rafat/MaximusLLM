@@ -370,148 +370,124 @@ class MatryoshkaManualFunction(torch.autograd.Function):
     def forward(ctx, hidden_states, embedding_weight, target_ids, 
                 low_rank_dim, n_candidates, chunk_size, aux_weight):
         
-        N, _ = hidden_states.shape
-        device = hidden_states.device
+        N, full_dim = hidden_states.shape
         dtype = hidden_states.dtype
         
         h_f = hidden_states
         h_l = h_f[:, :low_rank_dim]
         w_low = embedding_weight[:, :low_rank_dim]
 
-        total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        saved_chunks = []
-
         with torch.no_grad():
             w_norm_sq = (embedding_weight ** 2).sum(dim=-1).mean().item()
             w_low_norm_sq = (w_low ** 2).sum(dim=-1).mean().item()
 
-        stride = 4 
-        for i in range(0, N, chunk_size):
-            end = min(i + chunk_size, N)
-            curr_h_f = h_f[i:end]
-            curr_h_l = h_l[i:end]
-            curr_t_ids = target_ids[i:end]
+            stride = 4 
+            h_scouts = h_l[::stride] 
+            
+            scan_logits = torch.matmul(h_scouts, w_low.t())
 
-            with torch.no_grad():
-                h_scouts = curr_h_l[::stride] 
+            k_per_scout = max(1, n_candidates // h_scouts.size(0))
+            _, scout_top_idx = torch.topk(scan_logits, k_per_scout, dim=1)
+            
+            top_indices = scout_top_idx.reshape(-1).unique()
+            V_rem = 262144 - top_indices.size(0) - 1
 
-                scan_logits = torch.matmul(h_scouts, w_low.t())
+        w_f_pos = embedding_weight[target_ids]
+        w_f_cand = embedding_weight[top_indices]
+        
+        pos_sims = (h_f * w_f_pos).sum(dim=-1, keepdim=True)
+        neg_sims = torch.matmul(h_f, w_f_cand.t())
+        
+        is_target = (top_indices.unsqueeze(0) == target_ids.unsqueeze(1))
+        neg_sims = neg_sims.masked_fill(is_target, float('-inf'))
+        logits_m = torch.cat([pos_sims, neg_sims], dim=1).float()
+        
+        # adding a ghost token as a sink to keep gradients hot
+        curr_h_sq = (h_f ** 2).sum(dim=-1, keepdim=True).float()
+        var_m = (curr_h_sq * w_norm_sq) / full_dim
+        ghost_logits_m = math.log(max(1, V_rem)) + (var_m / 2.0)
+        
+        logits_m = torch.cat([logits_m, ghost_logits_m], dim=1)
+        # log softmax for stability
+        log_p_m = F.log_softmax(logits_m, dim=-1)
+        loss_m = -log_p_m[:, 0].sum()
 
-                k_per_scout = n_candidates // (chunk_size // stride)
-                _, top_indices = torch.topk(scan_logits, k_per_scout, dim=1)
-                
-                top_indices = top_indices.reshape(-1)
+        #   aux --------------------------------
+        w_l_pos = w_f_pos[:, :low_rank_dim]
+        w_l_cand = w_f_cand[:, :low_rank_dim]
+        
+        low_pos = (h_l * w_l_pos).sum(dim=-1, keepdim=True)
+        low_neg = torch.matmul(h_l, w_l_cand.t())
+        low_neg = low_neg.masked_fill(is_target, float('-inf'))
+        logits_a = torch.cat([low_pos, low_neg], dim=1).float()
+        
+        curr_h_l_sq = (h_l ** 2).sum(dim=-1, keepdim=True).float()
+        var_a = (curr_h_l_sq * w_low_norm_sq) / low_rank_dim
+        ghost_logits_a = math.log(max(1, V_rem)) + (var_a / 2.0)
+        
+        logits_a = torch.cat([logits_a, ghost_logits_a], dim=1)
+        log_p_a = F.log_softmax(logits_a, dim=-1)
+        loss_a = -log_p_a[:, 0].sum()
 
-            w_f_pos = embedding_weight[curr_t_ids]
-            w_f_cand = embedding_weight[top_indices]
-            
-            pos_sims = (curr_h_f * w_f_pos).sum(dim=-1, keepdim=True)
-            neg_sims = torch.matmul(curr_h_f, w_f_cand.t())
-            
-            is_target = (top_indices.unsqueeze(0) == curr_t_ids.unsqueeze(1))
-            neg_sims = neg_sims.masked_fill(is_target, float('-inf'))
-            logits_m = torch.cat([pos_sims, neg_sims], dim=1).float()
-            
-            vocab_size = 262144
-            V_rem = vocab_size - top_indices.size(0) - 1
-            full_dim = hidden_states.size(1)
-            
-            # adding a ghost token as a sink to keep gradients hot
-            curr_h_sq = (curr_h_f ** 2).sum(dim=-1, keepdim=True).float()
-            var_m = (curr_h_sq * w_norm_sq) / full_dim
-            ghost_logits_m = math.log(max(1, V_rem)) + (var_m / 2.0)
-            
-            logits_m = torch.cat([logits_m, ghost_logits_m], dim=1)
-            
-            # log softmax for stability
-            log_p_m = F.log_softmax(logits_m, dim=-1)
-            loss_m = -log_p_m[:, 0].sum()
+        total_loss = loss_m + aux_weight * loss_a
 
-            #   aux --------------------------------
-            w_l_pos = w_f_pos[:, :low_rank_dim]
-            w_l_cand = w_f_cand[:, :low_rank_dim]
-            
-            low_pos = (curr_h_l * w_l_pos).sum(dim=-1, keepdim=True)
-            low_neg = torch.matmul(curr_h_l, w_l_cand.t())
-            
-            low_neg = low_neg.masked_fill(is_target, float('-inf'))
-            logits_a = torch.cat([low_pos, low_neg], dim=1).float()
-            
-            curr_h_l_sq = (curr_h_l ** 2).sum(dim=-1, keepdim=True).float()
-            var_a = (curr_h_l_sq * w_low_norm_sq) / low_rank_dim
-            ghost_logits_a = math.log(max(1, V_rem)) + (var_a / 2.0)
-            
-            logits_a = torch.cat([logits_a, ghost_logits_a], dim=1)
-
-            log_p_a = F.log_softmax(logits_a, dim=-1)
-            loss_a = -log_p_a[:, 0].sum()
-
-            total_loss += (loss_m + aux_weight * loss_a)
-
-            # save softmax probs
-            saved_chunks.append((
-                curr_h_f, curr_t_ids, top_indices, 
-                log_p_m.exp().to(dtype), log_p_a.exp().to(dtype), 
-            ))
-
-        ctx.save_for_backward(hidden_states, embedding_weight)
+        ctx.save_for_backward(hidden_states, embedding_weight, target_ids, top_indices)
         ctx.aux_weight = aux_weight
         ctx.low_rank_dim = low_rank_dim
-        ctx.saved_chunks = saved_chunks
+        ctx.p_m_exp = log_p_m.exp().to(dtype)
+        ctx.p_a_exp = log_p_a.exp().to(dtype)
         
         return total_loss / N
 
     @staticmethod
     def backward(ctx, grad_output):
-        hidden_states, embedding_weight = ctx.saved_tensors
+        hidden_states, embedding_weight, target_ids, top_indices = ctx.saved_tensors
         aux_weight = ctx.aux_weight
+        low_rank_dim = ctx.low_rank_dim
         
         N, _ = hidden_states.shape
-        total_tokens = N
         dtype = hidden_states.dtype
         
-        grad_h = torch.zeros_like(hidden_states, dtype=torch.float32)
+        p_m = ctx.p_m_exp
+        p_a = ctx.p_a_exp
+
+        # Re-slice weights
+        w_fp = embedding_weight[target_ids].to(dtype)
+        w_fc = embedding_weight[top_indices].to(dtype)
+        w_lp = w_fp[:, :low_rank_dim]
+        w_lc = w_fc[:, :low_rank_dim]
+        
+        # index 0 = label
+        # CE gradient = (softmax - label)
+        dz_m = p_m.float().clone()
+        dz_m[:, 0] -= 1.0
+        dz_m = dz_m * (grad_output.float() / N)
+        
+        dz_a = p_a.float().clone()
+        dz_a[:, 0] -= 1.0
+        dz_a = dz_a * (grad_output.float() / N) * aux_weight
+
+        dz_m_dt, dz_a_dt = dz_m.to(dtype), dz_a.to(dtype)
+
+        # Gradient wrt hidden states
+        gh = dz_m_dt[:, :1] * w_fp + torch.matmul(dz_m_dt[:, 1:-1], w_fc)
+        ga = dz_a_dt[:, :1] * w_lp + torch.matmul(dz_a_dt[:, 1:-1], w_lc)
+        
+        grad_h = gh.float()
+        grad_h[:, :low_rank_dim] += ga.float()
+
+        # Gradient wrt embeddings
         grad_embed = torch.zeros_like(embedding_weight, dtype=torch.float32)
+        grad_embed_low = grad_embed[:, :low_rank_dim]
 
-        chunk_size = ctx.saved_chunks[0][0].shape[0]
-        grad_embed_low = grad_embed[:, :ctx.low_rank_dim]
+        h_f_float = hidden_states.float()
+        h_l_float = hidden_states[:, :low_rank_dim].float()
 
-        for i, chunk in enumerate(ctx.saved_chunks):
-            (h_f, t_ids, top_idx, p_m, p_a) = chunk
+        grad_embed.index_add_(0, target_ids, dz_m[:, :1] * h_f_float)
+        grad_embed.index_add_(0, top_indices, torch.matmul(dz_m_dt[:, 1:-1].t(), hidden_states.to(dtype)).float())
 
-            w_fp = embedding_weight[t_ids].to(dtype)
-            w_fc = embedding_weight[top_idx].to(dtype)
-            w_lp = w_fp[:, :ctx.low_rank_dim]
-            w_lc = w_fc[:, :ctx.low_rank_dim]
-            
-            # index 0 = label
-            # CE gradient = (softmax - label)
-            dz_m = p_m.float().clone()
-            dz_m[:, 0] -= 1.0
-            dz_m = dz_m * (grad_output.float() / total_tokens)
-            
-            dz_a = p_a.float().clone()
-            dz_a[:, 0] -= 1.0
-            dz_a = dz_a * (grad_output.float() / total_tokens) * aux_weight
-
-            dz_m_dt, dz_a_dt = dz_m.to(dtype), dz_a.to(dtype)
-
-            gh = dz_m_dt[:, :1] * w_fp
-            gh += torch.matmul(dz_m_dt[:, 1:-1], w_fc)
-            ga = dz_a_dt[:, :1] * w_lp + torch.matmul(dz_a_dt[:, 1:-1], w_lc)
-            
-            gh[:, :ctx.low_rank_dim] += ga
-            grad_h[i*chunk_size : i*chunk_size + h_f.shape[0]] = gh.float()
-
-            h_f_float = h_f.float()
-            grad_embed.index_add_(0, t_ids, dz_m[:, :1] * h_f_float)
-            h_f = h_f.to(dtype)
-            
-            grad_embed.index_add_(0, top_idx, torch.matmul(dz_m_dt[:, 1:-1].t(), h_f).float())
-
-            h_l_float = h_f_float[:, :ctx.low_rank_dim] 
-            grad_embed_low.index_add_(0, t_ids, dz_a[:, :1] * h_l_float)
-            grad_embed_low.index_add_(0, top_idx, torch.matmul(dz_a_dt[:, 1:-1].t(), h_f[:, :ctx.low_rank_dim]).float())
+        grad_embed_low.index_add_(0, target_ids, dz_a[:, :1] * h_l_float)
+        grad_embed_low.index_add_(0, top_indices, torch.matmul(dz_a_dt[:, 1:-1].t(), hidden_states[:, :low_rank_dim].to(dtype)).float())
  
         return grad_h.to(dtype), grad_embed.to(dtype), None, None, None, None, None
 
