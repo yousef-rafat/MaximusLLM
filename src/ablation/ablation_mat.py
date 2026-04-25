@@ -120,7 +120,7 @@ def run_experiment(name, loss_type, seed):
     peak_vram = 0.0
     for step, inputs in enumerate(train_buffer):
         inputs = inputs.to(device=DEVICE, dtype=torch.long, non_blocking=True)
-        
+
         model.train()
         optimizer.zero_grad()
 
@@ -132,19 +132,25 @@ def run_experiment(name, loss_type, seed):
             if step == 2:
                 torch.cuda.reset_peak_memory_stats()
         
+            h_bench = h_shift.detach().requires_grad_(True)
+            torch.cuda.synchronize()
             start_event.record()
             if loss_type == "liger":
-                loss = train_fn(model.embed_tokens.weight, h_shift, t_shift)
+                loss = train_fn(model.embed_tokens.weight, h_bench, t_shift)
             else:
-                loss = train_fn(h_shift, t_shift)
+                loss = train_fn(h_bench, t_shift)
             
             loss.backward()
             end_event.record()
+            torch.cuda.synchronize()
 
             if step == 2:
                 peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
+            
+            # plug the previous gradients to save compute
+            h_shift.backward(gradient=h_bench.grad)
+
         optimizer.step()
-        torch.cuda.synchronize()
         accumulated_loss_time += start_event.elapsed_time(end_event) / 1000.0
         
         if step % EVAL_INTERVAL == 0 or step == len(train_buffer) - 1:
