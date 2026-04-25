@@ -9,9 +9,29 @@ import torch.nn.functional as F
 from lora import blockswap_attention_layers
 from train import MatryoshkaSampledSoftmaxLoss
 import torch.nn as nn
-from ablation_mat import set_seed
 
-SEQ_LENS = [2048, 4096, 8192, 16384, 32768]
+import random
+import numpy as np
+import os
+
+def set_seed(seed: int):
+    if seed is None:
+        print("SEED IS NONE!", flush=True)
+        return
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    print(f"Fixed seed set to: {seed}")
+
+SEQ_LENS = [2048, 4096, 8192, 16384]
 
 torch.set_float32_matmul_precision('high')
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -21,7 +41,7 @@ SCALING_CONFIGS = [
     {"name": "180M", "h": 512,  "layers": 8,  "heads": 8},
     {"name": "440M", "h": 1024, "layers": 12, "heads": 16},
     {"name": "880M", "h": 1536, "layers": 16, "heads": 24},
-    {"name": "1.5B", "h": 2048, "layers": 19, "heads": 32},
+    {"name": "1B", "h": 2048, "layers": 14, "heads": 32},
 ]
 
 SEEDS = [42, 123, 999, 2035]
@@ -111,7 +131,8 @@ def run_ablation(name, setup_fn, train_steps=1000, seed=None):
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         train_fn = MatryoshkaSampledSoftmaxLoss(
-            model.embed_tokens.weight, low_rank_dim=64, n_candidates=2048, chunk_size=32
+            model.embed_tokens.weight, low_rank_dim=128,
+            n_candidates=min(8192, model.config.vocab_size // 64), chunk_size=max(128, model.config.hidden_size // 8)
         )
 
         print(f"--- Micro-Training {name} at Length {length} ---")

@@ -389,7 +389,7 @@ class MatryoshkaManualFunction(torch.autograd.Function):
             k_per_scout = max(1, n_candidates // h_scouts.size(0))
             _, scout_top_idx = torch.topk(scan_logits, k_per_scout, dim=1)
             
-            top_indices = scout_top_idx.reshape(-1).unique()
+            top_indices = scout_top_idx.reshape(-1)
             V_rem = 262144 - top_indices.size(0) - 1
 
         w_f_pos = embedding_weight[target_ids]

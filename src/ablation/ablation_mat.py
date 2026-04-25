@@ -20,7 +20,7 @@ SCALING_CONFIGS = [
     {"name": "180M", "h": 512,  "layers": 8,  "heads": 8},
     {"name": "440M", "h": 1024, "layers": 12, "heads": 16},
     {"name": "880M", "h": 1536, "layers": 16, "heads": 24},
-    {"name": "1.5B", "h": 2048, "layers": 19, "heads": 32},
+    {"name": "1.5B", "h": 2048, "layers": 14, "heads": 32},
 ]
 
 SEEDS = [42, 123, 999, 2035]
@@ -101,7 +101,7 @@ def run_experiment(name, loss_type, seed):
             train_fn = nn.CrossEntropyLoss()
     else:
         train_fn = MatryoshkaSampledSoftmaxLoss(
-            model.embed_tokens.weight, low_rank_dim=model.config.hidden_size // 8,
+            model.embed_tokens.weight, low_rank_dim=128,
             n_candidates=min(8192, model.config.vocab_size // 64), chunk_size=max(128, model.config.hidden_size // 8)
         )
 

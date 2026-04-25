@@ -110,6 +110,7 @@ class RandNLAGQALayer(nn.Module):
             nn.Tanh(),
             nn.Linear(64, 1)
         )
+        self.no_eff = True
 
     # use the kronecker product identity to save on computing the full P matrix
     def apply_sketch(self, x):
@@ -244,7 +245,7 @@ class RandNLAGQALayer(nn.Module):
 
         output_full = attn_output.flatten(2)
 
-        if self.training and seq_len > 2048:
+        if self.training and seq_len > 2048 and not self.no_eff:
             return self.compute_efficient_oproj(output_full)
         else: 
             return self.target_layer.o_proj(output_full)
@@ -345,7 +346,7 @@ class RandNLALatentAttention(RandNLAGQALayer):
         attn_output = torch.cat(output_chunks, dim=2)
         output_full = attn_output.transpose(1, 2).flatten(2)
 
-        if self.training and seq_len > 2048:
+        if self.training and seq_len > 2048 and not self.no_eff:
             return self.compute_efficient_oproj(output_full)
         else: 
             return self.target_layer.o_proj(output_full)
