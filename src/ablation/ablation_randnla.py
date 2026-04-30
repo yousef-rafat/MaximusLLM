@@ -49,11 +49,10 @@ SEEDS = [42, 123, 999, 2035]
 REPO_ID = "yousefg/MaximusLLM"
 config = Config.from_pretrained(REPO_ID)
 
-SAMPLES_TO_TRAIN = 2000
+SAMPLES_TO_TRAIN = 250
 BATCH_SIZE = 8
-SEQ_LEN = 1024
 DEVICE = "cuda"
-EVAL_INTERVAL = 100
+EVAL_INTERVAL = 50
 
 tokenizer = AutoTokenizer.from_pretrained(REPO_ID)
 dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
@@ -115,7 +114,7 @@ def setup_sliding_window(model, window_size=1024):
 def setup_randnla(model):
     blockswap_attention_layers(model)
 
-def run_ablation(name, setup_fn, train_steps=1000, seed=None):
+def run_ablation(name, setup_fn, train_steps=SAMPLES_TO_TRAIN, seed=None):
     set_seed(seed)
     print(f"\n{'='*40}\nRUNNING: {name}\n{'='*40}")
     results = {"vram": [], "speed": [], "ppl":[]}
@@ -124,7 +123,18 @@ def run_ablation(name, setup_fn, train_steps=1000, seed=None):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        model = Model(config, DEVICE, enabled_lm_head=True)
+        model = Model(config, DEVICE)
+        model.to(DEVICE)
+        model.create_lm_head()
+        def init_weights(module):
+            if isinstance(module, nn.Linear):
+                std = 0.02
+                nn.init.normal_(module.weight, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        model.apply(init_weights)
+        model.embed_tokens.embed_scale = torch.tensor(1.0)
         setup_fn(model)
         model.train()
         model.gradient_checkpointing = True
@@ -137,13 +147,13 @@ def run_ablation(name, setup_fn, train_steps=1000, seed=None):
 
         print(f"--- Micro-Training {name} at Length {length} ---")
         try:
-            for _ in range(train_steps):
+            for i in range(train_steps):
                 batch = get_real_batch(length)
                 if batch is None: 
                     break
                 
                 optimizer.zero_grad()
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                     hidden = model(batch, attention_mask = None, return_hidden = True)
                     h_shift = hidden[:, :-1, :].reshape(-1, config.hidden_size)
                     t_shift = batch[:, 1:].reshape(-1)
@@ -151,6 +161,9 @@ def run_ablation(name, setup_fn, train_steps=1000, seed=None):
                     
                 loss.backward()
                 optimizer.step()
+                if i % 50 == 0:
+                    print(f"`Step {i}/{train_steps} | Loss: {loss.item():.4f}`", flush=True)
+
                 
             model.eval()
             eval_batch = get_real_batch(length)
@@ -176,7 +189,7 @@ def run_ablation(name, setup_fn, train_steps=1000, seed=None):
 
             peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
 
-            print(f"Len {length:5} | PPL: {ppl:7.2f} | VRAM: {peak_vram:5.2f}GB | Speed: {length/dur:7.1f} tok/s")
+            print(f"Len {length:5} | LOSS: {val_loss:5.2f} | PPL: {ppl:7.2f} | VRAM: {peak_vram:5.2f}GB | Speed: {length/dur:7.1f} tok/s")
             
             results["ppl"].append(ppl)
             results["vram"].append(peak_vram)

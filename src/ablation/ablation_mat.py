@@ -19,8 +19,7 @@ torch.backends.cudnn.allow_tf32 = True
 SCALING_CONFIGS = [
     {"name": "180M", "h": 512,  "layers": 8,  "heads": 8},
     {"name": "440M", "h": 1024, "layers": 12, "heads": 16},
-    {"name": "880M", "h": 1536, "layers": 16, "heads": 24},
-    {"name": "1.5B", "h": 2048, "layers": 14, "heads": 32},
+    {"name": "1.2B", "h": 2048, "layers": 14, "heads": 32},
 ]
 
 SEEDS = [42, 123, 999, 2035]
@@ -28,11 +27,11 @@ SEEDS = [42, 123, 999, 2035]
 repo_id = "yousefg/MaximusLLM"
 config = Config.from_pretrained(repo_id)
 
-SAMPLES_TO_TRAIN = 2000
+SAMPLES_TO_TRAIN = 4000
 BATCH_SIZE = 8
-SEQ_LEN = 1024
+SEQ_LEN = 512
 DEVICE = "cuda"
-EVAL_INTERVAL = 100
+EVAL_INTERVAL = 500
 
 def set_seed(seed: int):
     if seed is None:
@@ -64,7 +63,7 @@ def get_next_batch():
         try:
             txt = next(iter_ds)["text"]
             toks = tokenizer(txt, truncation=True, max_length=SEQ_LEN, return_tensors="pt")["input_ids"]
-            if toks.size(1) > 50:
+            if toks.size(1) >= SEQ_LEN * 0.7:
                 batch_seqs.append(toks)
         except StopIteration: 
             return None
@@ -77,19 +76,34 @@ def get_next_batch():
 
 if "val_buffer" not in globals():
     val_buffer = [get_next_batch() for _ in range(20)]
-    train_buffer = [get_next_batch() for _ in range(SAMPLES_TO_TRAIN // BATCH_SIZE)]
-
-print(f">>> Loaded {len(train_buffer)} Training Batches.")
 
 
 # for validation we will run cross entropy for both of them to ensure fairness
-def run_experiment(name, loss_type, seed):
+def run_experiment(name, loss_type, seed, scale = 1.0):
     set_seed(seed)
 
     print("\n======================================")
     print(f"STARTING RUN: {name}")
     print("======================================")
     model = Model(config, DEVICE)
+
+    def init_weights(module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            nn.init.normal_(module.weight, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    model.apply(init_weights)
+
+    if scale != 1.0:
+        scale *= 1000
+    train_buffer = [get_next_batch() for _ in range((SAMPLES_TO_TRAIN + scale) // BATCH_SIZE)]
+
+    print(f">>> Loaded {len(train_buffer)} Training Batches.")
+
+
+    model.embed_tokens.embed_scale = torch.tensor(1.0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     model.to(DEVICE)
     model.gradient_checkpointing = True
@@ -205,8 +219,8 @@ for i, conf in enumerate(SCALING_CONFIGS):
 
     should_break = False
     try:
-        sl, tl, vl, vraml, speedl = run_experiment(f"{conf['name']}-Liger", "liger", seed=SEEDS[i])
-        sm, tm, vm, vramm, speedm = run_experiment(f"{conf['name']}-MAXIS", "maxis", seed=SEEDS[i])
+        sl, tl, vl, vraml, speedl = run_experiment(f"{conf['name']}-Liger", "liger", seed=SEEDS[i], scale = i + 1)
+        sm, tm, vm, vramm, speedm = run_experiment(f"{conf['name']}-MAXIS", "maxis", seed=SEEDS[i], scale = i + 1)
     except Exception as e:
         print(e, flush=True)
         pass
@@ -220,8 +234,8 @@ for i, conf in enumerate(SCALING_CONFIGS):
 
 def plot_results():
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    steps_l, time_l, val_l, vram_l, speed_l = all_results["1.5B"]["liger"]
-    steps_m, time_m, val_m, vram_m, speed_m = all_results["1.5B"]["maxis"]
+    steps_l, time_l, val_l, vram_l, speed_l = all_results["1.2B"]["liger"]
+    steps_m, time_m, val_m, vram_m, speed_m = all_results["1.2B"]["maxis"]
     # due to embedding scaling inherient in the model
     target_start_loss = 12.5 
     scaling_factor = val_l[0] / target_start_loss
