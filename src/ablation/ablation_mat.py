@@ -22,7 +22,7 @@ SCALING_CONFIGS = [
     {"name": "1.2B", "h": 2048, "layers": 14, "heads": 32},
 ]
 
-SEEDS = [42, 123, 999, 2035]
+SEEDS = [42, 123, 2035]
 
 repo_id = "yousefg/MaximusLLM"
 config = Config.from_pretrained(repo_id)
