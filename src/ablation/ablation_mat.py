@@ -238,15 +238,9 @@ def plot_results():
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     steps_l, time_l, val_l, vram_l, speed_l = all_results["1.2B"]["liger"]
     steps_m, time_m, val_m, vram_m, speed_m = all_results["1.2B"]["maxis"]
-    # due to embedding scaling inherient in the model
-    target_start_loss = 12.5 
-    scaling_factor = val_l[0] / target_start_loss
-    
-    norm_val_l = [x / scaling_factor for x in val_l]
-    norm_val_m = [x / scaling_factor for x in val_m]
 
-    ax1.plot(time_l, norm_val_l, label='Standard CE (Liger)', marker='o', color='gray', linestyle='-', linewidth=1.5)
-    ax1.plot(time_m, norm_val_m, label='MAXIS (Ours)', marker='s', color='blue', linewidth=2.5)
+    ax1.plot(time_l, val_l, label='Standard CE (Liger)', marker='o', color='gray', linestyle='-', linewidth=1.5)
+    ax1.plot(time_m, val_m, label='MAXIS (Ours)', marker='s', color='blue', linewidth=2.5)
     
     ax1.set_title("Intelligence per Second\n(Lower & Left is Better)")
     ax1.set_xlabel("Training Time (Seconds)")
