@@ -434,6 +434,8 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         ctx.save_for_backward(hidden_states, embedding_weight, target_ids, top_indices)
         ctx.aux_weight = aux_weight
         ctx.low_rank_dim = low_rank_dim
+        ctx.w_norm_sq = w_norm_sq
+        ctx.w_low_norm_sq = w_low_norm_sq
         ctx.p_m_exp = log_p_m.exp().to(dtype)
         ctx.p_a_exp = log_p_a.exp().to(dtype)
         
@@ -445,49 +447,54 @@ class MatryoshkaManualFunction(torch.autograd.Function):
         aux_weight = ctx.aux_weight
         low_rank_dim = ctx.low_rank_dim
         
-        N, _ = hidden_states.shape
+        N, full_dim = hidden_states.shape
         dtype = hidden_states.dtype
         
         p_m = ctx.p_m_exp
         p_a = ctx.p_a_exp
 
-        # Re-slice weights
-        w_fp = embedding_weight[target_ids].to(dtype)
-        w_fc = embedding_weight[top_indices].to(dtype)
-        w_lp = w_fp[:, :low_rank_dim]
-        w_lc = w_fc[:, :low_rank_dim]
-        
+        h_f_float = hidden_states.float()
+        h_l_float = hidden_states[:, :low_rank_dim].float()
+        w_fp_f = embedding_weight[target_ids].float()
+        w_fc_f = embedding_weight[top_indices].float()
+        w_lp_f = w_fp_f[:, :low_rank_dim]
+        w_lc_f = w_fc_f[:, :low_rank_dim]
+
         # index 0 = label
         # CE gradient = (softmax - label)
-        dz_m = p_m.float().clone()
-        dz_m[:, 0] -= 1.0
-        dz_m = dz_m * (grad_output.float() / N)
+        dz_m_f = p_m.float().clone()
+        dz_m_f[:, 0] -= 1.0
+        dz_m_f *= (grad_output.float() / N)
         
-        dz_a = p_a.float().clone()
-        dz_a[:, 0] -= 1.0
-        dz_a = dz_a * (grad_output.float() / N) * aux_weight
+        dz_a_f = p_a.float().clone()
+        dz_a_f[:, 0] -= 1.0
+        dz_a_f *= (grad_output.float() / N) * aux_weight
 
-        dz_m_dt, dz_a_dt = dz_m.to(dtype), dz_a.to(dtype)
+        # ----- hidden-state gradients -----
+        # main (full-rank)
+        gh = dz_m_f[:, :1] * w_fp_f + torch.matmul(dz_m_f[:, 1:-1], w_fc_f)
+        # add ghost → h
+        gh += dz_m_f[:, -1:] * h_f_float * (ctx.w_norm_sq / full_dim)
 
-        # Gradient wrt hidden states
-        gh = dz_m_dt[:, :1] * w_fp + torch.matmul(dz_m_dt[:, 1:-1], w_fc)
-        ga = dz_a_dt[:, :1] * w_lp + torch.matmul(dz_a_dt[:, 1:-1], w_lc)
-        
-        grad_h = gh.float()
-        grad_h[:, :low_rank_dim] += ga.float()
+        # aux (low-rank)
+        ga = dz_a_f[:, :1] * w_lp_f + torch.matmul(dz_a_f[:, 1:-1], w_lc_f)
+        # add ghost → h_l
+        ga += dz_a_f[:, -1:] * h_l_float * (ctx.w_low_norm_sq / low_rank_dim)
 
-        # Gradient wrt embeddings
+        grad_h = gh.clone()
+        grad_h[:, :low_rank_dim] += ga
+
+        # ----- embedding gradients -----
         grad_embed = torch.zeros_like(embedding_weight, dtype=torch.float32)
         grad_embed_low = grad_embed[:, :low_rank_dim]
 
-        h_f_float = hidden_states.float()
-        h_l_float = hidden_states[:, :low_rank_dim].float()
+        # main
+        grad_embed.index_add_(0, target_ids, dz_m_f[:, :1] * h_f_float)
+        grad_embed.index_add_(0, top_indices, torch.matmul(dz_m_f[:, 1:-1].t(), h_f_float))
 
-        grad_embed.index_add_(0, target_ids, dz_m[:, :1] * h_f_float)
-        grad_embed.index_add_(0, top_indices, torch.matmul(dz_m_dt[:, 1:-1].t(), hidden_states.to(dtype)).float())
-
-        grad_embed_low.index_add_(0, target_ids, dz_a[:, :1] * h_l_float)
-        grad_embed_low.index_add_(0, top_indices, torch.matmul(dz_a_dt[:, 1:-1].t(), hidden_states[:, :low_rank_dim].to(dtype)).float())
+        # aux
+        grad_embed_low.index_add_(0, target_ids, dz_a_f[:, :1] * h_l_float)
+        grad_embed_low.index_add_(0, top_indices, torch.matmul(dz_a_f[:, 1:-1].t(), h_l_float))
  
         return grad_h.to(dtype), grad_embed.to(dtype), None, None, None, None, None
 

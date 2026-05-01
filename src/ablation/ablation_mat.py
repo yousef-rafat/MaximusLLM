@@ -31,7 +31,7 @@ SAMPLES_TO_TRAIN = 4000
 BATCH_SIZE = 8
 SEQ_LEN = 512
 DEVICE = "cuda"
-EVAL_INTERVAL = 500
+EVAL_INTERVAL = 100
 
 def set_seed(seed: int):
     if seed is None:
