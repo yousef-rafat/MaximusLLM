@@ -127,12 +127,14 @@ def run_ablation(name, setup_fn, train_steps=SAMPLES_TO_TRAIN, seed=None):
         model.to(DEVICE)
         model.create_lm_head()
         def init_weights(module):
+            std = 0.02
             if isinstance(module, nn.Linear):
-                std = 0.02
                 nn.init.normal_(module.weight, std=std)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, std=std)
+            
         model.apply(init_weights)
         model.embed_tokens.embed_scale = torch.tensor(1.0)
         setup_fn(model)

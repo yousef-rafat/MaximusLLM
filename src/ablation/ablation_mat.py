@@ -88,11 +88,13 @@ def run_experiment(name, loss_type, seed, scale = 1.0):
     model = Model(config, DEVICE)
 
     def init_weights(module):
+        std = 0.02
         if isinstance(module, nn.Linear):
-            std = 0.02
             nn.init.normal_(module.weight, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, std=std)
 
     model.apply(init_weights)
 
